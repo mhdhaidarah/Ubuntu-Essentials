@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 sudo bash <<'EOF'
 export DEBIAN_FRONTEND=noninteractive
 command -v xl2tpd >/dev/null || { apt-get update && apt-get install -y strongswan xl2tpd ppp; }

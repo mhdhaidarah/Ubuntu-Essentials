@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SICO">
+  <defs>
+    <linearGradient id="sico-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0b1220"/>
+    </linearGradient>
+    <radialGradient id="sico-glow" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.34"/>
+      <stop offset="70%" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sico-stroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#sico-bg)"/>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#sico-glow)"/>
+  <!-- Code mark: < / > — SICO generates ready-to-import config/code -->
+  <g fill="none" stroke="url(#sico-stroke)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="24,21 13,32 24,43"/>
+    <polyline points="40,21 51,32 40,43"/>
+    <line x1="34.5" y1="19" x2="29.5" y2="45"/>
+  </g>
+</svg>

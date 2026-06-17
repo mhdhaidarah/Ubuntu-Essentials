@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 sudo bash <<'EOF'
 cat > /usr/local/sbin/hostname-wizard <<'SCRIPT'
 #!/bin/bash

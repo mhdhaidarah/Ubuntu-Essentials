@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+sudo bash <<'EOF'
+cat > /usr/local/sbin/netplan-wizard <<'SCRIPT'
+#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+
+BKROOT="/root/netplan-backups"
+TS="$(date +%Y%m%d%H%M%S)"
+BK="$BKROOT/backup-$TS"
+mkdir -p "$BK"; chmod 700 "$BK"
+
+for d in /etc/netplan/backup-*/; do
+  [ -d "$d" ] && mv "$d" "$BKROOT/" 2>/dev/null || true
+done
+cp /etc/netplan/*.yaml "$BK/" 2>/dev/null || true
+
+echo "Physical interfaces:"
+mapfile -t IFS_LIST < <(ip -o link show | awk -F': ' '$2!="lo" && $2 !~ /^(veth|docker|br-|virbr|wg|ppp|tun|tap)/{print $2}')
+[ "${#IFS_LIST[@]}" -eq 0 ] && { echo "No physical interfaces found."; exit 1; }
+for i in "${!IFS_LIST[@]}"; do
+  STATE=$(cat /sys/class/net/${IFS_LIST[$i]}/operstate 2>/dev/null)
+  CUR4=$(ip -4 -o addr show ${IFS_LIST[$i]} | awk '{print $4}' | head -1)
+  CUR6=$(ip -6 -o addr show scope global ${IFS_LIST[$i]} | awk '{print $4}' | head -1)
+  echo "  $((i+1))) ${IFS_LIST[$i]}  [$STATE]  v4=${CUR4:-none}  v6=${CUR6:-none}"
+done
+read -rp "Choose interface number: " N
+IFACE="${IFS_LIST[$((N-1))]}"
+[ -z "$IFACE" ] && { echo "Invalid choice"; exit 1; }
+
+RENDERER="networkd"
+FILE="/etc/netplan/99-${IFACE}-wizard.yaml"
+
+echo
+echo "IPv4 addressing:"
+echo "  1) DHCP"; echo "  2) Static"; echo "  3) Off / none"
+read -rp "Choose [1]: " M4; M4="${M4:-1}"
+if [ "$M4" = "2" ]; then
+  read -rp "  IPv4 with CIDR (e.g. 192.168.10.50/24): " IP4
+  read -rp "  IPv4 gateway (e.g. 192.168.10.2): " GW4
+fi
+
+echo
+echo "IPv6 addressing:"
+echo "  1) DHCPv6 (stateful)"; echo "  2) SLAAC / auto"; echo "  3) Static"; echo "  4) Off / none"
+read -rp "Choose [2]: " M6; M6="${M6:-2}"
+if [ "$M6" = "3" ]; then
+  read -rp "  IPv6 with prefix (e.g. 2001:db8::50/64): " IP6
+  read -rp "  IPv6 gateway (e.g. 2001:db8::1): " GW6
+fi
+
+# ---- DNS: default to Google IPv4 + IPv6 resolvers ----
+GOOGLE_DNS="8.8.8.8, 8.8.4.4, 2001:4860:4860::8888, 2001:4860:4860::8844"
+echo
+echo "DNS servers — default is Google (IPv4 + IPv6):"
+echo "  $GOOGLE_DNS"
+read -rp "Press Enter to accept, or type your own (space/comma separated): " DNS
+DNS="${DNS:-$GOOGLE_DNS}"
+DNS_YAML=$(echo "$DNS" | tr ',' ' ' | tr -s ' ' | sed 's/^ //;s/ $//;s/ /, /g')
+
+# ---- build clean YAML ----
+{
+  echo "network:"
+  echo "  version: 2"
+  echo "  renderer: $RENDERER"
+  echo "  ethernets:"
+  echo "    $IFACE:"
+  case "$M4" in 1) echo "      dhcp4: true" ;; *) echo "      dhcp4: false" ;; esac
+  case "$M6" in
+    1) echo "      dhcp6: true" ;;
+    2) echo "      dhcp6: false"; echo "      accept-ra: true" ;;
+    *) echo "      dhcp6: false"; echo "      accept-ra: false" ;;
+  esac
+  ADDRS=""
+  [ "$M4" = "2" ] && [ -n "$IP4" ] && ADDRS="$IP4"
+  if [ "$M6" = "3" ] && [ -n "$IP6" ]; then
+    [ -n "$ADDRS" ] && ADDRS="$ADDRS, $IP6" || ADDRS="$IP6"
+  fi
+  [ -n "$ADDRS" ] && echo "      addresses: [$ADDRS]"
+  if { [ "$M4" = "2" ] && [ -n "$GW4" ]; } || { [ "$M6" = "3" ] && [ -n "$GW6" ]; }; then
+    echo "      routes:"
+    [ "$M4" = "2" ] && [ -n "$GW4" ] && { echo "        - to: default"; echo "          via: $GW4"; }
+    [ "$M6" = "3" ] && [ -n "$GW6" ] && { echo "        - to: \"::/0\""; echo "          via: $GW6"; }
+  fi
+  echo "      nameservers:"
+  echo "        addresses: [$DNS_YAML]"
+} > "$FILE"
+chmod 600 "$FILE"
+
+for f in /etc/netplan/*.yaml; do
+  [ "$f" = "$FILE" ] && continue
+  mv "$f" "$BK/$(basename "$f").disabled"
+  echo "Disabled old config: $(basename "$f")  (saved in $BK)"
+done
+
+echo
+echo "Wrote $FILE :"
+echo "------------------------------------"; cat "$FILE"; echo "------------------------------------"
+
+if ! netplan generate 2>/tmp/netplan.err; then
+  echo "Config invalid:"; cat /tmp/netplan.err
+  echo "Restoring previous config."; rm -f "$FILE"
+  for b in "$BK"/*.disabled; do [ -e "$b" ] && cp "$b" "/etc/netplan/$(basename "${b%.disabled}")"; done
+  cp "$BK"/*.yaml /etc/netplan/ 2>/dev/null || true
+  exit 1
+fi
+
+echo
+read -rp "Use 'netplan try' safe-apply (auto-rollback if you lose access)? [Y/n]: " T
+if [ "$T" = "n" ] || [ "$T" = "N" ]; then
+  netplan apply; echo "Applied."
+else
+  echo "If your connection survives, press ENTER to keep changes."
+  if ! netplan try; then
+    echo "Rolled back. Restoring previous config."; rm -f "$FILE"
+    for b in "$BK"/*.disabled; do [ -e "$b" ] && cp "$b" "/etc/netplan/$(basename "${b%.disabled}")"; done
+    netplan apply || true
+  fi
+fi
+
+echo
+ls -la /etc/netplan/
+ip -4 -o addr show "$IFACE"; ip -6 -o addr show scope global "$IFACE"
+ip route | grep default || true
+SCRIPT
+chmod +x /usr/local/sbin/netplan-wizard
+echo "Installed. Run:  sudo netplan-wizard"
+EOF
+
+sudo netplan-wizard
