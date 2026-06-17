@@ -1,0 +1,151 @@
+sudo bash <<'EOF'
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y samba openssh-server
+
+mkdir -p /etc/share-server
+chmod 700 /etc/share-server
+mkdir -p /srv/shares
+
+# Base smb.conf hardening (only write once)
+if ! grep -q "# share-server managed" /etc/samba/smb.conf; then
+  cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%s) 2>/dev/null || true
+  cat > /etc/samba/smb.conf <<'SMBCONF'
+# share-server managed
+[global]
+   server string = File Server
+   workgroup = WORKGROUP
+   security = user
+   map to guest = never
+   server min protocol = SMB2
+   server signing = mandatory
+   smb encrypt = required
+   log file = /var/log/samba/%m.log
+   max log size = 1000
+
+# === share-server: per-share blocks appended below ===
+SMBCONF
+fi
+
+systemctl enable --now smbd ssh >/dev/null 2>&1 || true
+
+cat > /usr/local/sbin/share-wizard <<'SCRIPT'
+#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+
+reload_samba() { systemctl restart smbd; }
+
+add_share() {
+  read -rp "Share name (folder, e.g. data): " SHARE
+  [ -z "$SHARE" ] && { echo "Required"; exit 1; }
+  read -rp "Path [/srv/shares/$SHARE]: " SPATH; SPATH="${SPATH:-/srv/shares/$SHARE}"
+  read -rp "Username to grant access: " USER
+  read -rsp "Password (for SMB + SSH login): " PASS; echo
+  read -rp "Read-only? [y/N]: " RO
+
+  # System user (no shell login by default, but SSH/SFTP/SSHFS works; switch to bash if interactive SSH needed)
+  read -rp "Allow interactive SSH shell for this user? [y/N]: " SH
+  if [ "$SH" = "y" ] || [ "$SH" = "Y" ]; then SHELL_BIN="/bin/bash"; else SHELL_BIN="/usr/sbin/nologin"; fi
+
+  if ! id "$USER" >/dev/null 2>&1; then
+    useradd -m -s "$SHELL_BIN" "$USER"
+  else
+    usermod -s "$SHELL_BIN" "$USER"
+  fi
+  echo "$USER:$PASS" | chpasswd
+
+  # Samba account
+  (echo "$PASS"; echo "$PASS") | smbpasswd -s -a "$USER" >/dev/null
+  smbpasswd -e "$USER" >/dev/null
+
+  mkdir -p "$SPATH"
+  chown "$USER":"$USER" "$SPATH"
+  chmod 2770 "$SPATH"
+
+  WRITABLE="yes"; [ "$RO" = "y" ] || [ "$RO" = "Y" ] && WRITABLE="no"
+
+  # Append/refresh smb share block
+  sed -i "/^\[$SHARE\]/,/^\(\[\|$\)/d" /etc/samba/smb.conf 2>/dev/null || true
+  cat >> /etc/samba/smb.conf <<BLOCK
+
+[$SHARE]
+   path = $SPATH
+   valid users = $USER
+   writable = $WRITABLE
+   browseable = yes
+   create mask = 0660
+   directory mask = 0770
+BLOCK
+
+  echo "SHARE=$SHARE"  > "/etc/share-server/$SHARE.conf"
+  echo "SPATH=$SPATH" >> "/etc/share-server/$SHARE.conf"
+  echo "USER=$USER"   >> "/etc/share-server/$SHARE.conf"
+
+  reload_samba
+  IP=$(hostname -I | awk '{print $1}')
+  echo
+  echo "Done. Folder: $SPATH"
+  echo "  SMB  : //$IP/$SHARE   user=$USER"
+  echo "  SSHFS: $USER@$IP:$SPATH"
+}
+
+list_shares() {
+  mapfile -t SHARES < <(ls /etc/share-server/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//')
+}
+
+remove_share() {
+  list_shares
+  [ "${#SHARES[@]}" -eq 0 ] && { echo "No shares found."; return; }
+  echo "Existing shares:"
+  for i in "${!SHARES[@]}"; do
+    . "/etc/share-server/${SHARES[$i]}.conf"
+    echo "  $((i+1))) ${SHARES[$i]}  ( $SPATH  user=$USER )"
+  done
+  echo "  a) remove ALL"
+  read -rp "Choose number (or 'a'): " C
+  if [ "$C" = "a" ]; then TARGETS=("${SHARES[@]}")
+  else T="${SHARES[$((C-1))]}"; [ -z "$T" ] && { echo "Invalid"; return; }; TARGETS=("$T"); fi
+
+  for SHARE in "${TARGETS[@]}"; do
+    . "/etc/share-server/$SHARE.conf"
+    sed -i "/^\[$SHARE\]/,/^\(\[\|$\)/d" /etc/samba/smb.conf
+    read -rp "Also delete user '$USER' and data at '$SPATH'? [y/N]: " D
+    if [ "$D" = "y" ] || [ "$D" = "Y" ]; then
+      smbpasswd -x "$USER" >/dev/null 2>&1 || true
+      userdel "$USER" 2>/dev/null || true
+      rm -rf "$SPATH"
+      echo "  Deleted user + data."
+    else
+      smbpasswd -d "$USER" >/dev/null 2>&1 || true
+      echo "  Kept user/data; SMB share + access disabled."
+    fi
+    rm -f "/etc/share-server/$SHARE.conf"
+    echo "Removed share: $SHARE"
+  done
+  reload_samba
+}
+
+echo "Share Server Wizard (SMB + SSHFS)"
+echo "  1) Add a shared folder + user"
+echo "  2) Remove a share"
+echo "  3) Show shares & status"
+read -rp "Choose: " CHOICE
+case "$CHOICE" in
+  1) add_share ;;
+  2) remove_share ;;
+  3) echo "--- Samba ---"; smbstatus --shares 2>/dev/null || true
+     echo "--- Services ---"; systemctl is-active smbd ssh
+     echo "--- Managed shares ---"; ls /etc/share-server/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//' ;;
+  *) echo "Invalid choice"; exit 1 ;;
+esac
+SCRIPT
+chmod +x /usr/local/sbin/share-wizard
+
+IP=$(hostname -I | awk '{print $1}')
+echo "Installed. Server IP: $IP"
+echo "Run:  sudo share-wizard"
+EOF
+
+sudo share-wizard
+

@@ -1,0 +1,190 @@
+sudo bash <<'EOF'
+export DEBIAN_FRONTEND=noninteractive
+command -v xl2tpd >/dev/null || { apt-get update && apt-get install -y strongswan xl2tpd ppp; }
+mkdir -p /etc/l2tp-vpn
+chmod 700 /etc/l2tp-vpn
+mkdir -p /etc/xl2tpd /etc/ppp
+
+cat > /usr/local/sbin/l2tp-wizard <<'SCRIPT'
+#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+
+add_conn() {
+  read -rp "Connection name [vpn1]: " NAME; NAME="${NAME:-vpn1}"
+  read -rp "Server IP or domain: " SERVER
+  read -rp "Username: " USER
+  read -rsp "Password: " PASS; echo
+  read -rp "IPsec preshared key (Enter for plain L2TP, no IPsec): " PSK
+  read -rp "Route all traffic through VPN? [y/N]: " DEFRT
+
+  # --- strongSwan (IPsec) ---
+  if [ -n "$PSK" ]; then
+    # ipsec secrets
+    touch /etc/ipsec.secrets; chmod 600 /etc/ipsec.secrets
+    sed -i "/# l2tp-$NAME/d" /etc/ipsec.secrets 2>/dev/null || true
+    echo ": PSK \"$PSK\"  # l2tp-$NAME" >> /etc/ipsec.secrets
+
+    # ipsec.conf connection block
+    grep -q "^include /etc/ipsec.d/\*.conf" /etc/ipsec.conf 2>/dev/null || {
+      grep -q "config setup" /etc/ipsec.conf 2>/dev/null || echo "config setup" >> /etc/ipsec.conf
+      echo "include /etc/ipsec.d/*.conf" >> /etc/ipsec.conf
+    }
+    mkdir -p /etc/ipsec.d
+    cat > "/etc/ipsec.d/l2tp-$NAME.conf" <<IPSEC
+conn l2tp-$NAME
+    keyexchange=ikev1
+    authby=secret
+    auto=add
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=$SERVER
+    rightprotoport=17/1701
+    ike=aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!
+    esp=aes256-sha1,aes128-sha1,3des-sha1!
+IPSEC
+    systemctl enable strongswan-starter >/dev/null 2>&1 || systemctl enable strongswan >/dev/null 2>&1 || true
+    systemctl restart strongswan-starter 2>/dev/null || systemctl restart strongswan 2>/dev/null || ipsec restart
+  fi
+
+  # --- xl2tpd ---
+  cat > "/etc/xl2tpd/xl2tpd.conf" <<XL2TPD
+[lac $NAME]
+lns = $SERVER
+ppp debug = no
+pppoptfile = /etc/ppp/options.l2tpd.$NAME
+length bit = yes
+XL2TPD
+
+  cat > "/etc/ppp/options.l2tpd.$NAME" <<PPPOPT
+ipcp-accept-local
+ipcp-accept-remote
+refuse-eap
+require-mschap-v2
+noccp
+noauth
+mtu 1280
+mru 1280
+noipdefault
+$( [ "$DEFRT" = "y" ] || [ "$DEFRT" = "Y" ] && echo "defaultroute" && echo "replacedefaultroute" )
+usepeerdns
+connect-delay 5000
+name "$USER"
+password "$PASS"
+PPPOPT
+  chmod 600 "/etc/ppp/options.l2tpd.$NAME"
+
+  # control + connect helper scripts
+  cat > "/usr/local/sbin/l2tp-up-$NAME" <<UP
+#!/bin/bash
+$( [ -n "$PSK" ] && echo "ipsec up l2tp-$NAME" )
+echo "c $NAME" > /var/run/xl2tpd/l2tp-control
+UP
+  cat > "/usr/local/sbin/l2tp-down-$NAME" <<DOWN
+#!/bin/bash
+echo "d $NAME" > /var/run/xl2tpd/l2tp-control
+$( [ -n "$PSK" ] && echo "ipsec down l2tp-$NAME 2>/dev/null || true" )
+DOWN
+  chmod +x "/usr/local/sbin/l2tp-up-$NAME" "/usr/local/sbin/l2tp-down-$NAME"
+
+  systemctl enable xl2tpd >/dev/null 2>&1 || true
+  systemctl restart xl2tpd
+  sleep 2
+
+  # systemd service for reboot persistence
+  cat > "/etc/systemd/system/l2tp-$NAME.service" <<UNIT
+[Unit]
+Description=L2TP VPN ($NAME)
+After=network-online.target xl2tpd.service $( [ -n "$PSK" ] && echo "strongswan-starter.service" )
+Wants=network-online.target
+Requires=xl2tpd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/sbin/l2tp-up-$NAME
+ExecStop=/usr/local/sbin/l2tp-down-$NAME
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  {
+    echo "NAME=$NAME"; echo "SERVER=$SERVER"; echo "USER=$USER"
+    echo "PSK=$( [ -n "$PSK" ] && echo yes || echo no )"
+  } > "/etc/l2tp-vpn/$NAME.conf"
+
+  systemctl daemon-reload
+  systemctl enable --now "l2tp-$NAME.service"
+  sleep 3
+  echo
+  echo "Done. VPN=$NAME -> $SERVER  (IPsec: $( [ -n "$PSK" ] && echo on || echo off ))"
+  echo "Check: ip addr show ppp0 | ip route"
+}
+
+list_conns() {
+  mapfile -t CONNS < <(ls /etc/l2tp-vpn/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//')
+}
+
+remove_conn() {
+  list_conns
+  [ "${#CONNS[@]}" -eq 0 ] && { echo "No L2TP VPNs found."; return; }
+  echo "Existing VPNs:"
+  for i in "${!CONNS[@]}"; do
+    . "/etc/l2tp-vpn/${CONNS[$i]}.conf"
+    echo "  $((i+1))) ${CONNS[$i]}  ( $SERVER user=$USER ipsec=$PSK )"
+  done
+  echo "  a) remove ALL"
+  read -rp "Choose number (or 'a'): " C
+  if [ "$C" = "a" ]; then TARGETS=("${CONNS[@]}")
+  else T="${CONNS[$((C-1))]}"; [ -z "$T" ] && { echo "Invalid"; return; }; TARGETS=("$T"); fi
+
+  for NAME in "${TARGETS[@]}"; do
+    systemctl disable --now "l2tp-$NAME.service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/l2tp-$NAME.service"
+    rm -f "/usr/local/sbin/l2tp-up-$NAME" "/usr/local/sbin/l2tp-down-$NAME"
+    rm -f "/etc/ppp/options.l2tpd.$NAME"
+    rm -f "/etc/ipsec.d/l2tp-$NAME.conf"
+    sed -i "/# l2tp-$NAME/d" /etc/ipsec.secrets 2>/dev/null || true
+    rm -f "/etc/l2tp-vpn/$NAME.conf"
+    echo "Removed: $NAME"
+  done
+  # rebuild a clean xl2tpd.conf from whatever remains
+  : > /etc/xl2tpd/xl2tpd.conf
+  list_conns
+  for NAME in "${CONNS[@]}"; do
+    . "/etc/l2tp-vpn/$NAME.conf"
+    cat >> /etc/xl2tpd/xl2tpd.conf <<RE
+[lac $NAME]
+lns = $SERVER
+ppp debug = no
+pppoptfile = /etc/ppp/options.l2tpd.$NAME
+length bit = yes
+RE
+  done
+  systemctl restart xl2tpd 2>/dev/null || true
+  systemctl restart strongswan-starter 2>/dev/null || systemctl restart strongswan 2>/dev/null || true
+  systemctl daemon-reload
+}
+
+echo "L2TP/IPsec VPN Wizard"
+echo "  1) Add / configure a VPN"
+echo "  2) Remove a VPN"
+echo "  3) Show status"
+read -rp "Choose: " CHOICE
+case "$CHOICE" in
+  1) add_conn ;;
+  2) remove_conn ;;
+  3) ip addr show ppp0 2>/dev/null || echo "ppp0 not up"; echo
+     ipsec status 2>/dev/null || true; echo
+     systemctl list-units 'l2tp-*' --no-pager ;;
+  *) echo "Invalid choice"; exit 1 ;;
+esac
+SCRIPT
+chmod +x /usr/local/sbin/l2tp-wizard
+echo "Installed. Run:  sudo l2tp-wizard"
+EOF
+
+sudo l2tp-wizard

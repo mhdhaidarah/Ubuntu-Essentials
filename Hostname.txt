@@ -1,0 +1,36 @@
+sudo bash <<'EOF'
+cat > /usr/local/sbin/hostname-wizard <<'SCRIPT'
+#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+
+CURRENT=$(hostnamectl --static 2>/dev/null || hostname)
+echo "Current hostname: $CURRENT"
+read -rp "New hostname: " NEW
+[ -z "$NEW" ] && { echo "Required"; exit 1; }
+
+# basic validation: letters, digits, hyphen; no leading/trailing hyphen
+if ! echo "$NEW" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$'; then
+  echo "Invalid hostname. Use letters, digits, hyphens only."; exit 1
+fi
+
+hostnamectl set-hostname "$NEW"
+
+# keep /etc/hosts in sync
+if grep -qE '^\s*127\.0\.1\.1' /etc/hosts; then
+  sed -i -E "s/^(\s*127\.0\.1\.1\s+).*/\1$NEW/" /etc/hosts
+else
+  echo "127.0.1.1   $NEW" >> /etc/hosts
+fi
+
+echo "Hostname changed: $CURRENT -> $NEW"
+echo "Active now. New shells show it immediately."
+SCRIPT
+chmod +x /usr/local/sbin/hostname-wizard
+echo "Installed. Run:  sudo hostname-wizard"
+EOF
+
+sudo hostname-wizard
+
+exec bash
+

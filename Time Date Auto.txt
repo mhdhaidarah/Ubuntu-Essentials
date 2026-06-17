@@ -1,0 +1,66 @@
+sudo bash <<'EOF'
+cat > /usr/local/sbin/tz-wizard <<'SCRIPT'
+#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+
+# Main Middle East zones (label + IANA timezone)
+ZONES=(
+  "Beirut (Lebanon)|Asia/Beirut"
+  "Damascus (Syria)|Asia/Damascus"
+  "Baghdad (Iraq)|Asia/Baghdad"
+  "Amman (Jordan)|Asia/Amman"
+  "Jerusalem (Israel)|Asia/Jerusalem"
+  "Gaza (Palestine)|Asia/Gaza"
+  "Hebron (Palestine)|Asia/Hebron"
+  "Riyadh (Saudi Arabia)|Asia/Riyadh"
+  "Kuwait|Asia/Kuwait"
+  "Qatar (Doha)|Asia/Qatar"
+  "Bahrain (Manama)|Asia/Bahrain"
+  "Dubai / Abu Dhabi (UAE)|Asia/Dubai"
+  "Muscat (Oman)|Asia/Muscat"
+  "Sanaa (Yemen)|Asia/Aden"
+  "Tehran (Iran)|Asia/Tehran"
+  "Nicosia (Cyprus)|Asia/Nicosia"
+  "Istanbul (Turkey)|Europe/Istanbul"
+  "Cairo (Egypt)|Africa/Cairo"
+)
+
+CUR=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null)
+echo "Current timezone: ${CUR:-unknown}"
+echo
+echo "Choose a timezone:"
+for i in "${!ZONES[@]}"; do
+  LABEL="${ZONES[$i]%%|*}"
+  printf "  %2d) %s\n" "$((i+1))" "$LABEL"
+done
+echo "   0) Enter a custom IANA zone manually"
+echo
+read -rp "Number: " N
+
+if [ "$N" = "0" ]; then
+  read -rp "Custom IANA timezone (e.g. Asia/Beirut): " TZ
+else
+  SEL="${ZONES[$((N-1))]}"
+  [ -z "$SEL" ] && { echo "Invalid choice"; exit 1; }
+  TZ="${SEL##*|}"
+fi
+
+# validate
+if ! timedatectl list-timezones 2>/dev/null | grep -qx "$TZ"; then
+  [ -f "/usr/share/zoneinfo/$TZ" ] || { echo "Invalid timezone: $TZ"; exit 1; }
+fi
+
+timedatectl set-timezone "$TZ"
+timedatectl set-ntp yes
+
+echo
+echo "Set to $TZ with NTP enabled."
+echo
+timedatectl
+SCRIPT
+chmod +x /usr/local/sbin/tz-wizard
+echo "Installed. Run:  sudo tz-wizard"
+EOF
+
+sudo tz-wizard

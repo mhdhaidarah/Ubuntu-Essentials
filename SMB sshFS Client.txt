@@ -1,0 +1,136 @@
+sudo bash <<'EOF'
+command -v sshfs >/dev/null || { apt-get update && apt-get install -y sshfs; }
+mkdir -p /etc/sshfs-mounts /etc/sshfs-mounts/keys
+chmod 700 /etc/sshfs-mounts /etc/sshfs-mounts/keys
+
+cat > /usr/local/sbin/sshfs-wizard <<'SCRIPT'
+#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+
+add_conn() {
+  read -rp "Server IP or domain: " SERVER
+  read -rp "SSH port [22]: " PORT; PORT="${PORT:-22}"
+  read -rp "Username: " USER
+  read -rp "Remote path (e.g. /home/$USER/data or /srv/share): " RPATH
+
+  BASENAME=$(basename "$RPATH")
+  DEFAULT_MP="/opt/$BASENAME"
+  read -rp "Mount point [$DEFAULT_MP]: " MP; MP="${MP:-$DEFAULT_MP}"
+
+  NAME=$(echo "${SERVER}_${BASENAME}" | tr '/. ' '___')
+  KEY="/etc/sshfs-mounts/keys/$NAME"
+
+  echo
+  echo "Auth method:"
+  echo "  1) SSH key (recommended, survives reboot cleanly)"
+  echo "  2) Existing private key file (path)"
+  read -rp "Choose [1]: " AM; AM="${AM:-1}"
+
+  case "$AM" in
+    1)
+      if [ ! -f "$KEY" ]; then
+        ssh-keygen -t ed25519 -N "" -f "$KEY" -C "sshfs-$NAME" >/dev/null
+      fi
+      chmod 600 "$KEY"
+      echo
+      echo ">> Add this PUBLIC key to ${USER}@${SERVER}:~/.ssh/authorized_keys :"
+      echo "----------------------------------------------------------------"
+      cat "$KEY.pub"
+      echo "----------------------------------------------------------------"
+      echo "Tip: ssh-copy-id -i $KEY.pub -p $PORT $USER@$SERVER"
+      read -rp "Press Enter once the key is installed on the server..." _
+      ;;
+    2)
+      read -rp "Path to existing private key: " SRC
+      cp "$SRC" "$KEY"; chmod 600 "$KEY"
+      ;;
+    *) echo "Invalid"; exit 1 ;;
+  esac
+
+  # Prime known_hosts so the mount unit doesn't hang on host-key prompt
+  ssh-keyscan -p "$PORT" -H "$SERVER" >> /root/.ssh/known_hosts 2>/dev/null || true
+
+  mkdir -p "$MP"
+  UNIT="$(systemd-escape -p --suffix=mount "$MP")"
+
+  cat > "/etc/systemd/system/$UNIT" <<UNITF
+[Unit]
+Description=SSHFS mount $USER@$SERVER:$RPATH -> $MP
+After=network-online.target
+Wants=network-online.target
+
+[Mount]
+What=$USER@$SERVER:$RPATH
+Where=$MP
+Type=fuse.sshfs
+Options=_netdev,nofail,x-systemd.automount,IdentityFile=$KEY,port=$PORT,allow_other,default_permissions,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,StrictHostKeyChecking=accept-new,uid=0,gid=0
+
+[Install]
+WantedBy=multi-user.target
+UNITF
+
+  {
+    echo "MP=$MP"; echo "UNIT=$UNIT"; echo "SERVER=$SERVER"
+    echo "USER=$USER"; echo "RPATH=$RPATH"; echo "KEY=$KEY"
+  } > "/etc/sshfs-mounts/$NAME.conf"
+
+  systemctl daemon-reload
+  systemctl enable --now "$UNIT"
+  echo
+  echo "Done. $USER@$SERVER:$RPATH mounted at $MP"
+  echo "Check: df -h | grep '$MP'  ||  systemctl status '$UNIT'"
+}
+
+list_conns() {
+  mapfile -t CONNS < <(ls /etc/sshfs-mounts/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//')
+}
+
+remove_conn() {
+  list_conns
+  [ "${#CONNS[@]}" -eq 0 ] && { echo "No SSHFS mounts found."; return; }
+  echo "Existing mounts:"
+  for i in "${!CONNS[@]}"; do
+    . "/etc/sshfs-mounts/${CONNS[$i]}.conf"
+    echo "  $((i+1))) ${CONNS[$i]}  ( $USER@$SERVER:$RPATH -> $MP )"
+  done
+  echo "  a) remove ALL"
+  read -rp "Choose number (or 'a'): " C
+
+  if [ "$C" = "a" ]; then TARGETS=("${CONNS[@]}")
+  else
+    T="${CONNS[$((C-1))]}"; [ -z "$T" ] && { echo "Invalid choice"; return; }
+    TARGETS=("$T")
+  fi
+
+  for NAME in "${TARGETS[@]}"; do
+    . "/etc/sshfs-mounts/$NAME.conf"
+    AUTO="${UNIT%.mount}.automount"
+    systemctl disable --now "$AUTO" 2>/dev/null || true
+    systemctl disable --now "$UNIT" 2>/dev/null || true
+    umount "$MP" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$UNIT"
+    rm -f "/etc/sshfs-mounts/$NAME.conf" "$KEY" "$KEY.pub"
+    rmdir "$MP" 2>/dev/null || true
+    echo "Removed: $NAME ($MP)"
+  done
+  systemctl daemon-reload
+}
+
+echo "SSHFS Mount Wizard"
+echo "  1) Add / mount a remote path"
+echo "  2) Remove a mount"
+echo "  3) Show status"
+read -rp "Choose: " CHOICE
+case "$CHOICE" in
+  1) add_conn ;;
+  2) remove_conn ;;
+  3) df -h --type=fuse.sshfs 2>/dev/null; echo; systemctl list-units '*.mount' --no-pager | grep -i opt || true ;;
+  *) echo "Invalid choice"; exit 1 ;;
+esac
+SCRIPT
+chmod +x /usr/local/sbin/sshfs-wizard
+echo "Installed. Run:  sudo sshfs-wizard"
+EOF
+
+sudo sshfs-wizard
