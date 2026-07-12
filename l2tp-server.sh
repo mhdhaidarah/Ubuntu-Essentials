@@ -25,7 +25,9 @@ setup_server() {
   # needed). Enter 'none' for IPv4-only.
   read -rp "IPv6 ULA prefix (Enter=fc11::/64, or 'none'): " SUBNET6; SUBNET6="${SUBNET6:-fc11::/64}"
   [ "$SUBNET6" = "none" ] && SUBNET6=""
-  read -rp "DNS to hand to clients [1.1.1.1]: " DNS; DNS="${DNS:-1.1.1.1}"
+  # Google DNS. L2TP pushes IPv4 DNS via pppd ms-dns; the IPv6 DNS (Google) is set on
+  # the client by the connect snippet, since ms-dns is IPv4-only.
+  read -rp "DNS to hand to clients [8.8.8.8]: " DNS; DNS="${DNS:-8.8.8.8}"
   read -rp "IPsec preshared key (Enter for plain L2TP, no IPsec): " PSK
 
   local BASE; BASE="${SUBNET%.*}"
@@ -42,7 +44,7 @@ IPRANGE=$IPRANGE
 SUBNET6=$SUBNET6
 PREFIX6=$PREFIX6
 SRV_IP6=$SRV_IP6
-DNS=$DNS
+DNS="$DNS"
 IPSEC=$( [ -n "$PSK" ] && echo yes || echo no )
 E
   chmod 600 "$ENVF"
@@ -338,14 +340,14 @@ connect_snippet() {
     1)
       echo
       echo "═══ MikroTik — paste into the client router's terminal ═══"
+      # One line per command (no '\' continuations) so it pastes cleanly by any method.
       if [ "$IPSEC" = yes ]; then
-        echo "/interface l2tp-client add name=l2tp-securytik connect-to=$SRV \\"
-        echo "    user=$U password=$P use-ipsec=yes ipsec-secret=\"${PSKVAL:-<PSK>}\" \\"
-        echo "    profile=default-encryption add-default-route=yes disabled=no"
+        echo "/interface l2tp-client add name=l2tp-securytik connect-to=$SRV user=$U password=$P use-ipsec=yes ipsec-secret=\"${PSKVAL:-<PSK>}\" profile=default-encryption add-default-route=yes disabled=no"
       else
-        echo "/interface l2tp-client add name=l2tp-securytik connect-to=$SRV \\"
-        echo "    user=$U password=$P add-default-route=yes disabled=no"
+        echo "/interface l2tp-client add name=l2tp-securytik connect-to=$SRV user=$U password=$P add-default-route=yes disabled=no"
       fi
+      # Google DNS (v4 + v6) on the client, since L2TP's ms-dns only carries IPv4.
+      echo "/ip dns set servers=8.8.8.8,2001:4860:4860::8888"
       if [ -n "$SUBNET6" ]; then
         [ -n "$V6" ] && echo "/ipv6 address add address=$V6/64 interface=l2tp-securytik advertise=no" \
                      || echo "# IPv6: pin this user to a fixed IP to get a stable v6; then fc11::<host>"
@@ -354,6 +356,24 @@ connect_snippet() {
       echo "═════════════════════════════════════════════════════════"
       ;;
     2)
+      # IPv6 lines, only when the server is dual-stack AND this user has a pinned v6.
+      # A client ipv6-up.d hook re-adds the ULA + v6 default route on every (re)connect,
+      # so IPv6 survives reboots/redials. $1 (the ppp iface) must stay literal in the
+      # generated hook, hence \$1 here.
+      # NOTE: this whole block ends up inside the pasted  sudo bash -c '...'  so it must
+      # contain NO single quotes (they'd close the outer '...'). The hook is written with
+      # a double-quoted heredoc; \$1 stays literal at paste time (the ppp iface).
+      local v6opt="" v6hook=""
+      if [ -n "$SUBNET6" ] && [ -n "$V6" ]; then
+        v6opt=$'+ipv6\nipv6cp-accept-local\nipv6cp-accept-remote'
+        v6hook="mkdir -p /etc/ppp/ipv6-up.d
+cat > /etc/ppp/ipv6-up.d/securytik-v6 <<\"HEOF\"
+#!/bin/bash
+ip -6 addr add $V6/64 dev \"\$1\" 2>/dev/null || true
+ip -6 route replace default dev \"\$1\" 2>/dev/null || true
+HEOF
+chmod +x /etc/ppp/ipv6-up.d/securytik-v6"
+      fi
       echo
       echo "═══ Ubuntu — paste into the client's shell (installs xl2tpd if missing) ═══"
       cat <<UB
@@ -390,18 +410,18 @@ maxfail 0
 holdoff 5
 lcp-echo-interval 10
 lcp-echo-failure 6
+${v6opt}
 name "$U"
 password "$P"
 PP
 chmod 600 /etc/ppp/options.l2tpd.securytik
-systemctl enable --now xl2tpd
-sleep 2; echo "c securytik" > /var/run/xl2tpd/l2tp-control
-sleep 6; ip -4 addr show | grep ppp || echo "no ppp yet — check journalctl -u xl2tpd"
+${v6hook}
+systemctl enable xl2tpd >/dev/null 2>&1
+systemctl restart xl2tpd
+sleep 3; echo "c securytik" > /var/run/xl2tpd/l2tp-control
+sleep 8; ip -4 addr show | grep ppp && ip -6 addr show | grep -i fc1 || echo "check journalctl -u xl2tpd"
 '
 UB
-      [ -n "$SUBNET6" ] && echo "# IPv6 over the tunnel is served by the server (ULA + NAT66); on Ubuntu the ppp" \
-        && echo "# link is IPv4-transported — add the v6 addr after connect if you need it:" \
-        && echo "#   sudo ip -6 addr add ${V6:-${PREFIX6}<host>}/64 dev ppp0 && sudo ip -6 route add default dev ppp0"
       echo "════════════════════════════════════════════════════════════════════════════"
       ;;
     *) : ;;

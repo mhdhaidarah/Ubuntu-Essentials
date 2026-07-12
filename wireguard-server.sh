@@ -122,7 +122,8 @@ setup_server() {
   # needed). Enter 'none' for IPv4-only.
   read -rp "IPv6 ULA prefix (Enter=fc10::/64, or 'none'): " SUBNET6; SUBNET6="${SUBNET6:-fc10::/64}"
   [ "$SUBNET6" = "none" ] && SUBNET6=""
-  read -rp "DNS to hand to clients [1.1.1.1]: " DNS; DNS="${DNS:-1.1.1.1}"
+  # Google DNS, dual-stack, so clients resolve over both IPv4 and IPv6.
+  read -rp "DNS to hand to clients [8.8.8.8, 2001:4860:4860::8888]: " DNS; DNS="${DNS:-8.8.8.8, 2001:4860:4860::8888}"
   SRV_IP="${SUBNET%.*}.1"
   local PREFIX6="" SRV_IP6=""
   if [ -n "$SUBNET6" ]; then
@@ -144,7 +145,7 @@ SRV_IP=$SRV_IP
 SUBNET6=$SUBNET6
 PREFIX6=$PREFIX6
 SRV_IP6=$SRV_IP6
-DNS=$DNS
+DNS="$DNS"
 E
 
   # Forwarding must also survive a reboot — PostUp only covers the wg-quick path.
@@ -256,25 +257,37 @@ connect_snippet() {
   read -rp "Print a ready-to-paste connect snippet for the client? [1] MikroTik  [2] Ubuntu  [Enter] skip: " WANT
   case "$WANT" in
     1)
+      local dns_mt="${dns// /}"
       echo
-      echo "═══ MikroTik — paste into the client router's terminal ═══"
+      echo "═══ MikroTik — paste into the client router's terminal (full-tunnel, paste as one block) ═══"
       cat <<MT
 /interface wireguard add name=wg-securytik private-key="$priv" mtu=1420
 /ip address add address=$a4 interface=wg-securytik
-/interface wireguard peers add interface=wg-securytik \\
-    public-key="$spub" preshared-key="$psk" \\
-    endpoint-address=$ehost endpoint-port=$eport \\
-    allowed-address=$allowed_mt persistent-keepalive=25s
 MT
       [ -n "$a6" ] && echo "/ipv6 address add address=$a6 interface=wg-securytik advertise=no"
-      # Full-tunnel needs a default route + NAT the router can't safely guess; flag it.
+      # One line per command (no '\' continuations) so it pastes cleanly by any method.
+      cat <<MT
+/interface wireguard peers add interface=wg-securytik public-key="$spub" preshared-key="$psk" endpoint-address=$ehost endpoint-port=$eport allowed-address=$allowed_mt persistent-keepalive=25s
+/ip dns set servers=$dns_mt
+MT
+      # Full tunnel: pin the WG endpoint to the client's current WAN gateway (so the
+      # encrypted packets are NOT routed back into the tunnel), then default-route
+      # everything via wg. Each line is standalone (the gateway is looked up INLINE),
+      # so it works pasted line-by-line into a Winbox/SSH terminal — a ':local' variable
+      # would NOT survive between pasted lines.
       case "$allowed" in
-        *0.0.0.0/0*) echo "# Full tunnel: also route traffic out of wg-securytik, e.g." ;
-                     echo "#   /ip route add dst-address=0.0.0.0/0 gateway=wg-securytik" ;
-                     echo "#   /ip firewall nat add chain=srcnat out-interface=wg-securytik action=masquerade" ;
-                     [ -n "$a6" ] && echo "#   /ipv6 route add dst-address=::/0 gateway=wg-securytik" ;;
+        *0.0.0.0/0*)
+          if printf '%s' "$ehost" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            echo "/ip route add dst-address=$ehost/32 gateway=[/ip route get [find where dst-address=\"0.0.0.0/0\" and active] gateway] comment=\"wg-securytik endpoint bypass\""
+          else
+            echo "# endpoint is a hostname; add the bypass by hand, e.g.:"
+            echo "#   /ip route add dst-address=<server-ip>/32 gateway=<your-wan-gateway> comment=\"wg-securytik endpoint bypass\""
+          fi
+          echo "/ip route add dst-address=0.0.0.0/0 gateway=wg-securytik"
+          [ -n "$a6" ] && echo "/ipv6 route add dst-address=::/0 gateway=wg-securytik"
+          ;;
       esac
-      echo "═════════════════════════════════════════════════════════"
+      echo "═══════════════════════════════════════════════════════════════════════════════"
       ;;
     2)
       echo
