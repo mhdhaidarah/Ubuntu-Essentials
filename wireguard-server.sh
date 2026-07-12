@@ -23,9 +23,25 @@ ENVF="/etc/wireguard/server.env"
 rebuild_conf() {
   . "$ENVF"
   umask 077
+  # Dual-stack: the server carries a ULA (fc10::1/64 by default) alongside its IPv4.
+  # Most boxes get no delegated IPv6 prefix, so clients are NAT66'd out of the WAN just
+  # like IPv4 — they get working IPv6 without the ISP handing us a prefix. SUBNET6 empty
+  # ⇒ IPv4-only (v6 lines are simply omitted).
+  local addr6line="" v6up="" v6down=""
+  if [ -n "$SUBNET6" ]; then
+    addr6line="Address = $SRV_IP6/64"
+    v6up="PostUp   = sysctl -w net.ipv6.conf.all.forwarding=1
+PostUp   = ip6tables -t nat -A POSTROUTING -s $SUBNET6 -o $WAN_IF -j MASQUERADE
+PostUp   = ip6tables -A FORWARD -i $WGIF -o $WAN_IF -j ACCEPT
+PostUp   = ip6tables -A FORWARD -i $WAN_IF -o $WGIF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    v6down="PostDown = ip6tables -t nat -D POSTROUTING -s $SUBNET6 -o $WAN_IF -j MASQUERADE
+PostDown = ip6tables -D FORWARD -i $WGIF -o $WAN_IF -j ACCEPT
+PostDown = ip6tables -D FORWARD -i $WAN_IF -o $WGIF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+  fi
   cat > "$CONF" <<IFACE
 [Interface]
 Address = $SRV_IP/24
+${addr6line:+$addr6line}
 ListenPort = $PORT
 PrivateKey = $(cat /etc/wireguard/server_private.key)
 
@@ -35,31 +51,39 @@ PostUp   = iptables -t nat -A POSTROUTING -s $SUBNET -o $WAN_IF -j MASQUERADE
 PostUp   = iptables -A FORWARD -i $WGIF -o $WAN_IF -j ACCEPT
 PostUp   = iptables -A FORWARD -i $WAN_IF -o $WGIF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostUp   = iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o $WAN_IF -j TCPMSS --clamp-mss-to-pmtu
+${v6up:+$v6up}
 PostDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $WAN_IF -j MASQUERADE
 PostDown = iptables -D FORWARD -i $WGIF -o $WAN_IF -j ACCEPT
 PostDown = iptables -D FORWARD -i $WAN_IF -o $WGIF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostDown = iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o $WAN_IF -j TCPMSS --clamp-mss-to-pmtu
+${v6down:+$v6down}
 IFACE
 
-  local f name priv pub psk addr
+  local f name priv pub psk addr addr6
   for f in "$CDIR"/*.conf; do
     [ -e "$f" ] || continue
     name="$(basename "$f" .conf)"
     # Split on the FIRST '=' only: base64 keys are '='-padded, so a '='-delimited
     # field split would silently truncate the padding and produce an invalid key.
     priv="$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
-    addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$f" | head -1 | cut -d, -f1 | cut -d/ -f1)"
+    # Address line is "10.7.0.5/24" or "10.7.0.5/24, fc10::5/64" — take v4 and v6 halves.
+    addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$f" | head -1 | cut -d, -f1 | sed 's,/.*,,')"
+    addr6="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$f" | head -1 | cut -d, -f2- | tr -d ' ' | sed 's,/.*,,')"
     pub="$(echo "$priv" | wg pubkey)"
     psk="$(cat "$CDIR/$name.psk" 2>/dev/null || true)"
+    local allowed="$addr/32"
+    [ -n "$SUBNET6" ] && [ -n "$addr6" ] && [ "$addr6" != "$addr" ] && allowed="$allowed, $addr6/128"
     {
       echo
       echo "### client $name"
       echo "[Peer]"
       echo "PublicKey = $pub"
       [ -n "$psk" ] && echo "PresharedKey = $psk"
-      echo "AllowedIPs = $addr/32"
+      echo "AllowedIPs = $allowed"
     } >> "$CONF"
   done
+  # wg-quick chokes on blank in-between lines from omitted v6 vars; squeeze them.
+  sed -i '/^$/N;/^\n$/D' "$CONF"
   chmod 600 "$CONF"
 }
 
@@ -94,8 +118,17 @@ setup_server() {
   read -rp "WAN interface (the uplink to NAT out of) [$DEF_WAN]: " WAN_IF; WAN_IF="${WAN_IF:-$DEF_WAN}"
   read -rp "Listen port [51820]: " PORT; PORT="${PORT:-51820}"
   read -rp "VPN subnet [10.7.0.0/24]: " SUBNET; SUBNET="${SUBNET:-10.7.0.0/24}"
+  # Dual-stack by default: a ULA prefix the clients get NAT66'd out of (no ISP prefix
+  # needed). Enter 'none' for IPv4-only.
+  read -rp "IPv6 ULA prefix (Enter=fc10::/64, or 'none'): " SUBNET6; SUBNET6="${SUBNET6:-fc10::/64}"
+  [ "$SUBNET6" = "none" ] && SUBNET6=""
   read -rp "DNS to hand to clients [1.1.1.1]: " DNS; DNS="${DNS:-1.1.1.1}"
   SRV_IP="${SUBNET%.*}.1"
+  local PREFIX6="" SRV_IP6=""
+  if [ -n "$SUBNET6" ]; then
+    PREFIX6="${SUBNET6%%/*}"        # fc10::/64 -> fc10::
+    SRV_IP6="${PREFIX6}1"           # -> fc10::1
+  fi
 
   [ -f /etc/wireguard/server_private.key ] || {
     umask 077
@@ -108,12 +141,16 @@ WAN_IF=$WAN_IF
 PORT=$PORT
 SUBNET=$SUBNET
 SRV_IP=$SRV_IP
+SUBNET6=$SUBNET6
+PREFIX6=$PREFIX6
+SRV_IP6=$SRV_IP6
 DNS=$DNS
 E
 
   # Forwarding must also survive a reboot — PostUp only covers the wg-quick path.
-  echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard.conf
+  { echo "net.ipv4.ip_forward=1"; [ -n "$SUBNET6" ] && echo "net.ipv6.conf.all.forwarding=1"; } > /etc/sysctl.d/99-wireguard.conf
   sysctl -q -w net.ipv4.ip_forward=1
+  [ -n "$SUBNET6" ] && sysctl -q -w net.ipv6.conf.all.forwarding=1
 
   rebuild_conf
   systemctl enable "wg-quick@$WGIF" >/dev/null 2>&1 || true
@@ -126,7 +163,8 @@ E
   }
 
   echo
-  echo "Server up on $ENDPOINT:$PORT — clients get $SUBNET and route the internet through $WAN_IF."
+  echo "Server up on $ENDPOINT:$PORT — clients get $SUBNET$([ -n "$SUBNET6" ] && echo " + $SUBNET6") and route the internet through $WAN_IF."
+  [ -n "$SUBNET6" ] && echo "IPv6: dual-stack on, clients NAT66'd out of $WAN_IF (server $SRV_IP6)."
   echo "Server public key: $(cat /etc/wireguard/server_public.key)"
 }
 
@@ -141,8 +179,12 @@ add_client() {
   read -rp "Route ALL of this client's traffic through the server (full tunnel)? [Y/n]: " FT
   if [ "$FT" = "n" ] || [ "$FT" = "N" ]; then ALLOWED="$SUBNET"; else ALLOWED="0.0.0.0/0, ::/0"; fi
 
-  local IP PRIV PUB PSK
+  local IP PRIV PUB PSK octet IP6 addrline
   IP="$(next_ip)"; [ "$IP" = "ERR" ] && { echo "Subnet full."; return 1; }
+  octet="${IP##*.}"
+  addrline="$IP/24"
+  # Dual-stack: same host number in the ULA (10.7.0.5 -> fc10::5), so v4 and v6 line up.
+  if [ -n "$SUBNET6" ]; then IP6="${PREFIX6}${octet}"; addrline="$IP/24, $IP6/64"; fi
   umask 077
   PRIV="$(wg genkey)"; PUB="$(echo "$PRIV" | wg pubkey)"; PSK="$(wg genpsk)"
   echo "$PSK" > "$CDIR/$NAME.psk"
@@ -150,7 +192,7 @@ add_client() {
   cat > "$CDIR/$NAME.conf" <<C
 [Interface]
 PrivateKey = $PRIV
-Address = $IP/24
+Address = $addrline
 DNS = $DNS
 
 [Peer]
@@ -202,8 +244,11 @@ connect_snippet() {
   endpoint="$(sed -n 's/^Endpoint[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
   allowed="$(sed -n 's/^AllowedIPs[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
   local ehost="${endpoint%:*}" eport="${endpoint##*:}"
-  local addr_ip="${addr%%/*}" addr_cidr="$addr"
-  [ "$addr_cidr" = "${addr_cidr%/*}" ] && addr_cidr="$addr_ip/24"
+  # Address may be "10.7.0.5/24" or dual-stack "10.7.0.5/24, fc10::5/64".
+  local a4 a6
+  a4="$(echo "$addr" | cut -d, -f1 | tr -d ' ')"                 # 10.7.0.5/24
+  a6="$(echo "$addr" | cut -d, -f2- | tr -d ' ')"                # fc10::5/64  (empty if v4-only)
+  [ "$a6" = "$a4" ] && a6=""
   # RouterOS wants the allowed-address list comma-joined with no spaces.
   local allowed_mt="${allowed// /}"
 
@@ -215,17 +260,19 @@ connect_snippet() {
       echo "═══ MikroTik — paste into the client router's terminal ═══"
       cat <<MT
 /interface wireguard add name=wg-securytik private-key="$priv" mtu=1420
-/ip address add address=$addr_cidr interface=wg-securytik
+/ip address add address=$a4 interface=wg-securytik
 /interface wireguard peers add interface=wg-securytik \\
     public-key="$spub" preshared-key="$psk" \\
     endpoint-address=$ehost endpoint-port=$eport \\
     allowed-address=$allowed_mt persistent-keepalive=25s
 MT
+      [ -n "$a6" ] && echo "/ipv6 address add address=$a6 interface=wg-securytik advertise=no"
       # Full-tunnel needs a default route + NAT the router can't safely guess; flag it.
       case "$allowed" in
-        *0.0.0.0/0*) echo "# Full tunnel: also route LAN out of wg-securytik, e.g." ;
+        *0.0.0.0/0*) echo "# Full tunnel: also route traffic out of wg-securytik, e.g." ;
                      echo "#   /ip route add dst-address=0.0.0.0/0 gateway=wg-securytik" ;
-                     echo "#   /ip firewall nat add chain=srcnat out-interface=wg-securytik action=masquerade" ;;
+                     echo "#   /ip firewall nat add chain=srcnat out-interface=wg-securytik action=masquerade" ;
+                     [ -n "$a6" ] && echo "#   /ipv6 route add dst-address=::/0 gateway=wg-securytik" ;;
       esac
       echo "═════════════════════════════════════════════════════════"
       ;;
@@ -240,7 +287,7 @@ umask 077; mkdir -p /etc/wireguard
 cat > /etc/wireguard/wg-securytik.conf <<WGCONF
 [Interface]
 PrivateKey = $priv
-Address = $addr_cidr
+Address = $addr
 DNS = $dns
 [Peer]
 PublicKey = $spub
