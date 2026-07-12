@@ -11,13 +11,57 @@ cat > /usr/local/sbin/l2tp-wizard <<'SCRIPT'
 set -e
 [ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
 
+list_conns() {
+  mapfile -t CONNS < <(ls /etc/l2tp-vpn/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//')
+}
+
+# xl2tpd.conf holds ONE [lac] block per VPN, so it must always be rebuilt from the full set
+# of saved connections in /etc/l2tp-vpn — writing it from a single connection would silently
+# drop every other VPN on the box.
+rebuild_xl2tpd() {
+  : > /etc/xl2tpd/xl2tpd.conf
+  local f
+  for f in /etc/l2tp-vpn/*.conf; do
+    [ -e "$f" ] || continue
+    # subshell: sourcing sets NAME/SERVER/USER and must not clobber the caller's copies
+    (
+      . "$f"
+      cat >> /etc/xl2tpd/xl2tpd.conf <<RE
+[lac $NAME]
+lns = $SERVER
+ppp debug = no
+pppoptfile = /etc/ppp/options.l2tpd.$NAME
+length bit = yes
+redial = yes
+redial timeout = 10
+max redials = 0
+RE
+    )
+  done
+}
+
 add_conn() {
   read -rp "Connection name [vpn1]: " NAME; NAME="${NAME:-vpn1}"
   read -rp "Server IP or domain: " SERVER
   read -rp "Username: " USER
   read -rsp "Password: " PASS; echo
-  read -rp "IPsec preshared key (Enter for plain L2TP, no IPsec): " PSK
+
+  # IPsec is opt-in: most MikroTik/L2TP setups run plain L2TP, and silently attempting
+  # IPsec against a server that doesn't want it is the usual reason a dial never comes up.
+  read -rp "Use IPsec? (y = enter a PSK, Enter = plain L2TP, no IPsec) [n]: " USE_IPSEC
+  PSK=""
+  if [ "$USE_IPSEC" = "y" ] || [ "$USE_IPSEC" = "Y" ]; then
+    while :; do
+      read -rsp "IPsec preshared key: " PSK; echo
+      [ -n "$PSK" ] && break
+      echo "  A PSK is required when IPsec is on (Ctrl-C to abort)."
+    done
+  fi
   read -rp "Route all traffic through VPN? [y/N]: " DEFRT
+
+  # 1400 is the value verified against a plain-L2TP LNS; IPsec's ESP overhead needs a
+  # smaller ceiling or large packets fragment and stall.
+  if [ -n "$PSK" ]; then MTU=1280; else MTU=1400; fi
 
   # --- strongSwan (IPsec) ---
   if [ -n "$PSK" ]; then
@@ -49,15 +93,22 @@ IPSEC
     systemctl restart strongswan-starter 2>/dev/null || systemctl restart strongswan 2>/dev/null || ipsec restart
   fi
 
-  # --- xl2tpd ---
-  cat > "/etc/xl2tpd/xl2tpd.conf" <<XL2TPD
-[lac $NAME]
-lns = $SERVER
-ppp debug = no
-pppoptfile = /etc/ppp/options.l2tpd.$NAME
-length bit = yes
-XL2TPD
+  # --- save this connection, then rebuild xl2tpd.conf from ALL of them ---
+  {
+    echo "NAME=$NAME"; echo "SERVER=$SERVER"; echo "USER=$USER"
+    echo "PSK=$( [ -n "$PSK" ] && echo yes || echo no )"
+  } > "/etc/l2tp-vpn/$NAME.conf"
+  rebuild_xl2tpd
 
+  # --- Keepalives: read this before blaming the client ---
+  # If the LNS is a MikroTik, its L2TP server keepalive-timeout (default 30s) counts ONLY
+  # L2TP control-channel HELLOs. xl2tpd sends its first HELLO after 60s of control-channel
+  # idle, so it can never beat a 30s timeout: the router tears the tunnel down with
+  # CDN + StopCCN ~25s after it comes up, even while data is flowing. PPP LCP echoes do not
+  # save you — the router answers them and kills the session anyway. Fix it on the router:
+  #     /interface l2tp-server server set keepalive-timeout=disabled     (or a value > 60)
+  # persist/maxfail/holdoff + lcp-echo-* below let this client notice a dead peer and redial
+  # (the packaged systemd unit only dials once); they cannot prevent an LNS-side timeout.
   cat > "/etc/ppp/options.l2tpd.$NAME" <<PPPOPT
 ipcp-accept-local
 ipcp-accept-remote
@@ -65,11 +116,16 @@ refuse-eap
 require-mschap-v2
 noccp
 noauth
-mtu 1280
-mru 1280
+mtu $MTU
+mru $MTU
 noipdefault
 $( [ "$DEFRT" = "y" ] || [ "$DEFRT" = "Y" ] && echo "defaultroute" && echo "replacedefaultroute" )
 usepeerdns
+persist
+maxfail 0
+holdoff 5
+lcp-echo-interval 10
+lcp-echo-failure 6
 connect-delay 5000
 name "$USER"
 password "$PASS"
@@ -89,9 +145,21 @@ $( [ -n "$PSK" ] && echo "ipsec down l2tp-$NAME 2>/dev/null || true" )
 DOWN
   chmod +x "/usr/local/sbin/l2tp-up-$NAME" "/usr/local/sbin/l2tp-down-$NAME"
 
+  # The permanent client rides the packaged xl2tpd daemon. l2tp-client-once.sh disables that
+  # daemon (it runs its own private instance), so re-enable it here — otherwise a box that
+  # once hosted a temporary support tunnel could never bring a permanent VPN up again.
   systemctl enable xl2tpd >/dev/null 2>&1 || true
   systemctl restart xl2tpd
   sleep 2
+
+  # The restart above dropped every tunnel xl2tpd was holding — re-dial the other VPNs,
+  # otherwise adding a second VPN quietly takes the first one offline until the next reboot.
+  for _f in /etc/l2tp-vpn/*.conf; do
+    [ -e "$_f" ] || continue
+    _n="$(basename "$_f" .conf)"
+    [ "$_n" = "$NAME" ] && continue
+    echo "c $_n" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  done
 
   # systemd service for reboot persistence
   cat > "/etc/systemd/system/l2tp-$NAME.service" <<UNIT
@@ -112,21 +180,12 @@ ExecStop=/usr/local/sbin/l2tp-down-$NAME
 WantedBy=multi-user.target
 UNIT
 
-  {
-    echo "NAME=$NAME"; echo "SERVER=$SERVER"; echo "USER=$USER"
-    echo "PSK=$( [ -n "$PSK" ] && echo yes || echo no )"
-  } > "/etc/l2tp-vpn/$NAME.conf"
-
   systemctl daemon-reload
   systemctl enable --now "l2tp-$NAME.service"
   sleep 3
   echo
   echo "Done. VPN=$NAME -> $SERVER  (IPsec: $( [ -n "$PSK" ] && echo on || echo off ))"
   echo "Check: ip addr show ppp0 | ip route"
-}
-
-list_conns() {
-  mapfile -t CONNS < <(ls /etc/l2tp-vpn/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//')
 }
 
 remove_conn() {
@@ -153,21 +212,17 @@ remove_conn() {
     echo "Removed: $NAME"
   done
   # rebuild a clean xl2tpd.conf from whatever remains
-  : > /etc/xl2tpd/xl2tpd.conf
-  list_conns
-  for NAME in "${CONNS[@]}"; do
-    . "/etc/l2tp-vpn/$NAME.conf"
-    cat >> /etc/xl2tpd/xl2tpd.conf <<RE
-[lac $NAME]
-lns = $SERVER
-ppp debug = no
-pppoptfile = /etc/ppp/options.l2tpd.$NAME
-length bit = yes
-RE
-  done
+  rebuild_xl2tpd
   systemctl restart xl2tpd 2>/dev/null || true
   systemctl restart strongswan-starter 2>/dev/null || systemctl restart strongswan 2>/dev/null || true
   systemctl daemon-reload
+  sleep 2
+
+  # ...and re-dial the survivors, which the restart just dropped.
+  list_conns
+  for _n in "${CONNS[@]}"; do
+    echo "c $_n" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  done
 }
 
 echo "L2TP/IPsec VPN Wizard"
