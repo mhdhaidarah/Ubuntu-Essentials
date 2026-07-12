@@ -47,6 +47,18 @@ USE_IPSEC=0; [ -n "$PSK" ] && USE_IPSEC=1
 # A running packaged xl2tpd would hold UDP/1701 and silently swallow our packets.
 systemctl stop xl2tpd 2>/dev/null || true
 
+# Reap ORPHANED temporary tunnels from an earlier run of this wizard (a crash, a closed
+# SSH session, an old version). They are not under systemd, so stopping the packaged unit
+# does not touch them — they just sit there holding UDP/1701. Several xl2tpds bound to the
+# same port is exactly what makes dialing a coin flip: the L2TP replies land in whichever
+# socket the kernel picks. Only ever kill instances whose config lives in /tmp, which by
+# definition means a disposable wizard run — never a permanent VPN.
+for _pid in $(pgrep -f 'xl2tpd .*-c /tmp/l2tp-(once|wizard-once)\.' 2>/dev/null); do
+  echo "  reaping stale temporary xl2tpd (pid $_pid) from an earlier run..."
+  kill "$_pid" 2>/dev/null || true
+done
+sleep 1
+
 # --- optional IPsec ---
 if [ "$USE_IPSEC" = "1" ]; then
   command -v ipsec >/dev/null || { echo "Installing strongswan..."; apt-get update && apt-get install -y strongswan >/dev/null; }
@@ -73,6 +85,11 @@ IPSEC
 fi
 
 # --- xl2tpd, entirely under $RUNDIR ---
+# 'max redials' must be >= 1: xl2tpd rejects 0 with "rmax value must be at least 1" and
+# then refuses to load the WHOLE config, so the daemon never starts. There is no
+# "unlimited" — a large count is how you say "keep trying".
+# Keep this heredoc free of '#' comments: xl2tpd's parser treats them as data and dies
+# with "line too long or no '=' in data".
 cat > "$RUNDIR/xl2tpd.conf" <<CONF
 [global]
 port = 1701
@@ -84,9 +101,6 @@ pppoptfile = $RUNDIR/options.l2tpd
 length bit = yes
 redial = yes
 redial timeout = 10
-# NOT 0 — xl2tpd rejects that outright ("rmax value must be at least 1") and then
-# refuses to load the whole config, so the daemon never starts. There is no
-# "unlimited" here; a large count is the way to say "keep trying".
 max redials = 65535
 CONF
 

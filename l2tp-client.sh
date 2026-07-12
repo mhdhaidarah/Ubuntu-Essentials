@@ -18,6 +18,10 @@ list_conns() {
 # xl2tpd.conf holds ONE [lac] block per VPN, so it must always be rebuilt from the full set
 # of saved connections in /etc/l2tp-vpn — writing it from a single connection would silently
 # drop every other VPN on the box.
+#
+# Two xl2tpd config-parser landmines, both of which stop the daemon loading AT ALL:
+#   * 'max redials' must be >= 1 (0 is not "unlimited" — it is a fatal error).
+#   * no '#' comments inside the generated file; it reads them as data.
 rebuild_xl2tpd() {
   : > /etc/xl2tpd/xl2tpd.conf
   local f
@@ -34,8 +38,6 @@ pppoptfile = /etc/ppp/options.l2tpd.$NAME
 length bit = yes
 redial = yes
 redial timeout = 10
-# NOT 0 — xl2tpd rejects that ("rmax value must be at least 1") and then refuses to
-# load the config at all, so the daemon never starts. A large count means "keep trying".
 max redials = 65535
 RE
     )
