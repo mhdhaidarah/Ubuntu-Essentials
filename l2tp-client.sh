@@ -34,7 +34,9 @@ pppoptfile = /etc/ppp/options.l2tpd.$NAME
 length bit = yes
 redial = yes
 redial timeout = 10
-max redials = 0
+# NOT 0 — xl2tpd rejects that ("rmax value must be at least 1") and then refuses to
+# load the config at all, so the daemon never starts. A large count means "keep trying".
+max redials = 65535
 RE
     )
   done
@@ -225,22 +227,105 @@ remove_conn() {
   done
 }
 
+# Force a redial from the stored config: drop the LAC, then dial it again. The tunnel can
+# sit "configured" but dead after the peer reboots or the WAN flaps, and pppd's own redial
+# only fires when it notices the drop — this makes it happen now.
+reconnect_conn() {
+  list_conns
+  [ "${#CONNS[@]}" -eq 0 ] && { echo "No L2TP VPNs found."; return; }
+  echo "Existing VPNs:"
+  local i
+  for i in "${!CONNS[@]}"; do echo "  $((i+1))) ${CONNS[$i]}"; done
+  echo "  a) reconnect ALL"
+  read -rp "Choose number (or 'a'): " C
+  if [ "$C" = "a" ]; then TARGETS=("${CONNS[@]}")
+  else T="${CONNS[$((C-1))]}"; [ -z "$T" ] && { echo "Invalid"; return; }; TARGETS=("$T"); fi
+
+  # xl2tpd must actually be running for the control FIFO to exist.
+  systemctl is-active xl2tpd >/dev/null 2>&1 || { echo "Starting xl2tpd..."; systemctl start xl2tpd; sleep 2; }
+
+  for NAME in "${TARGETS[@]}"; do
+    ( . "/etc/l2tp-vpn/$NAME.conf"
+      echo "Reconnecting $NAME -> $SERVER ..."
+      [ "$PSK" = "yes" ] && { ipsec down "l2tp-$NAME" 2>/dev/null || true; ipsec up "l2tp-$NAME" 2>/dev/null || true; }
+    )
+    echo "d $NAME" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+    sleep 2
+    echo "c $NAME" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  done
+
+  sleep 5
+  if ip -o -4 addr show 2>/dev/null | grep -q ppp; then
+    echo "Up:"; ip -o -4 addr show | grep ppp | awk '{print "  " $2 "  " $4}'
+  else
+    echo "No ppp interface yet. Check 'journalctl -u xl2tpd -n 30'."
+    echo "If it authenticates then drops after ~25s, raise keepalive-timeout on the server."
+  fi
+}
+
+usage() {
+  echo
+  echo "─────────────────────────────────────────────────────────────"
+  echo "How to use it from now on:"
+  echo "  sudo l2tp-wizard             this menu (add / remove / reconnect / status)"
+  echo "  sudo l2tp-reconnect          force-redial every VPN from its saved config"
+  echo "  sudo l2tp-reconnect <name>   force-redial just that VPN"
+  echo "  sudo l2tp-up-<name>          dial one VPN"
+  echo "  sudo l2tp-down-<name>        hang one VPN up"
+  echo "  ip addr show ppp0            check the tunnel address"
+  echo
+  echo "  VPNs are saved in /etc/l2tp-vpn/ and dial at boot via l2tp-<name>.service."
+  echo "  They redial by themselves after a drop (persist + lcp-echo); 'reconnect' just"
+  echo "  forces it immediately."
+  echo "─────────────────────────────────────────────────────────────"
+}
+
 echo "L2TP/IPsec VPN Wizard"
 echo "  1) Add / configure a VPN"
 echo "  2) Remove a VPN"
-echo "  3) Show status"
+echo "  3) Reconnect a VPN (force redial from the saved config)"
+echo "  4) Show status"
 read -rp "Choose: " CHOICE
 case "$CHOICE" in
   1) add_conn ;;
   2) remove_conn ;;
-  3) ip addr show ppp0 2>/dev/null || echo "ppp0 not up"; echo
+  3) reconnect_conn ;;
+  4) ip addr show ppp0 2>/dev/null || echo "ppp0 not up"; echo
      ipsec status 2>/dev/null || true; echo
      systemctl list-units 'l2tp-*' --no-pager ;;
   *) echo "Invalid choice"; exit 1 ;;
 esac
+usage
 SCRIPT
 chmod +x /usr/local/sbin/l2tp-wizard
-echo "Installed. Run:  sudo l2tp-wizard"
+
+# Standalone force-redial, usable over SSH without walking the menu.
+cat > /usr/local/sbin/l2tp-reconnect <<'RECON'
+#!/bin/bash
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+if [ -n "$1" ]; then
+  TARGETS=("$1")
+else
+  mapfile -t TARGETS < <(ls /etc/l2tp-vpn/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//')
+fi
+[ "${#TARGETS[@]}" -eq 0 ] && { echo "No L2TP VPNs configured."; exit 1; }
+systemctl is-active xl2tpd >/dev/null 2>&1 || { systemctl start xl2tpd; sleep 2; }
+for NAME in "${TARGETS[@]}"; do
+  [ -f "/etc/l2tp-vpn/$NAME.conf" ] || { echo "No such VPN: $NAME"; continue; }
+  ( . "/etc/l2tp-vpn/$NAME.conf"
+    echo "Reconnecting $NAME -> $SERVER ..."
+    [ "$PSK" = "yes" ] && { ipsec down "l2tp-$NAME" 2>/dev/null || true; ipsec up "l2tp-$NAME" 2>/dev/null || true; } )
+  echo "d $NAME" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  sleep 2
+  echo "c $NAME" > /var/run/xl2tpd/l2tp-control 2>/dev/null || true
+done
+sleep 5
+ip -o -4 addr show 2>/dev/null | grep ppp | awk '{print "  up: " $2 "  " $4}' || \
+  echo "  no ppp interface yet — check 'journalctl -u xl2tpd -n 30'"
+RECON
+chmod +x /usr/local/sbin/l2tp-reconnect
+
+echo "Installed. Run:  sudo l2tp-wizard   (or: sudo l2tp-reconnect [name])"
 EOF
 
 sudo l2tp-wizard

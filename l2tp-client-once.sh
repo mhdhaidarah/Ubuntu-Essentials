@@ -84,7 +84,10 @@ pppoptfile = $RUNDIR/options.l2tpd
 length bit = yes
 redial = yes
 redial timeout = 10
-max redials = 0
+# NOT 0 — xl2tpd rejects that outright ("rmax value must be at least 1") and then
+# refuses to load the whole config, so the daemon never starts. There is no
+# "unlimited" here; a large count is the way to say "keep trying".
+max redials = 65535
 CONF
 
 # --- Keepalives: read this before blaming the client ---
@@ -134,7 +137,7 @@ if [ "$USE_IPSEC" = "1" ]; then
   sed -i "/# l2tp-once/d" /etc/ipsec.secrets 2>/dev/null || true
   ipsec restart 2>/dev/null || systemctl restart strongswan 2>/dev/null || true
 fi
-rm -f /usr/local/sbin/l2tp-once-down
+rm -f /usr/local/sbin/l2tp-once-down /usr/local/sbin/l2tp-once-reconnect
 echo "Tunnel down, temporary files removed."
 
 # Hand UDP/1701 back to the packaged daemon and re-dial any permanent VPNs we displaced.
@@ -150,6 +153,41 @@ if ls /etc/l2tp-vpn/*.conf >/dev/null 2>&1; then
 fi
 DOWN
 chmod +x /usr/local/sbin/l2tp-once-down
+
+# Force-reconnect using the SAME temporary config. xl2tpd redials on its own, but after a
+# long outage (or if the daemon itself died) this re-dials now — without re-typing the
+# credentials, which is the whole point during a support call.
+cat > /usr/local/sbin/l2tp-once-reconnect <<RECON
+#!/bin/bash
+[ "\$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
+[ -d "$RUNDIR" ] || { echo "The temporary tunnel is gone (rebooted or torn down). Re-run: sudo l2tp-once"; exit 1; }
+
+# Revive our private xl2tpd if it is no longer running — the config is still on disk.
+if ! pgrep -f "$RUNDIR/xl2tpd.conf" >/dev/null 2>&1; then
+  echo "xl2tpd is not running — restarting it from the saved config..."
+  systemctl stop xl2tpd 2>/dev/null || true
+  setsid xl2tpd -D -c "$RUNDIR/xl2tpd.conf" -C "$CTRL" -p "$RUNDIR/xl2tpd.pid" \\
+    >> "$RUNDIR/xl2tpd.log" 2>&1 < /dev/null &
+  for _ in \$(seq 1 20); do [ -p "$CTRL" ] && break; sleep 0.5; done
+fi
+
+echo "Redialing $NAME -> $SERVER ..."
+echo "d $NAME" > "$CTRL" 2>/dev/null || true
+sleep 2
+echo "c $NAME" > "$CTRL" 2>/dev/null || true
+
+for _ in \$(seq 1 20); do
+  PPPIF=\$(ip -o -4 addr show 2>/dev/null | grep -oE 'ppp[0-9]+' | head -1)
+  if [ -n "\$PPPIF" ]; then
+    echo "Connected: \$PPPIF \$(ip -4 -o addr show "\$PPPIF" | awk '{print \$4}')"
+    exit 0
+  fi
+  sleep 1
+done
+echo "Still not up. Check the server, then: tail -20 $RUNDIR/xl2tpd.log"
+exit 1
+RECON
+chmod +x /usr/local/sbin/l2tp-once-reconnect
 
 echo
 echo "Starting L2TP to $SERVER as $VPNUSER  (IPsec: $([ "$USE_IPSEC" = 1 ] && echo on || echo off)) ..."
@@ -171,9 +209,16 @@ for _ in $(seq 1 30); do
     TUNIP=$(ip -4 -o addr show "$PPPIF" | awk '{print $4}'); TUNIP="${TUNIP%%/*}"
     echo
     echo "Connected: $PPPIF  $TUNIP"
-    echo "  Reach this box from the far side of the VPN:  ssh <user>@$TUNIP"
-    echo "  Tear it down:                                 sudo l2tp-once-down"
-    echo "  (No systemd unit, no /etc config — a reboot also clears it.)"
+    echo
+    echo "─────────────────────────────────────────────────────────────"
+    echo "How to use it:"
+    echo "  ssh <user>@$TUNIP          reach this box from the far side of the VPN"
+    echo "  sudo l2tp-once-reconnect      force a redial (same credentials, no re-typing)"
+    echo "  sudo l2tp-once-down           tear it down and clean up"
+    echo
+    echo "  This tunnel is TEMPORARY: it lives in $RUNDIR, has no systemd unit and"
+    echo "  no /etc config, so a reboot clears it. It redials by itself if it drops."
+    echo "─────────────────────────────────────────────────────────────"
     exit 0
   fi
   sleep 1
