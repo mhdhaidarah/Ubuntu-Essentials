@@ -184,6 +184,79 @@ show_client() {
     echo "Scan with the WireGuard phone app:"
     qrencode -t ansiutf8 < "$CDIR/$NAME.conf"
   fi
+  connect_snippet "$NAME"
+}
+
+# Offer a ready-to-paste snippet the OTHER side runs to connect back — so you don't have
+# to hand-translate the .conf into router or server commands. The .conf itself is the
+# source of truth; everything here is parsed from it.
+connect_snippet() {
+  local NAME="$1" f="$CDIR/$1.conf"
+  # first '=' split only — base64 keys are '='-padded (a naive split truncates them).
+  local priv addr dns spub psk endpoint allowed
+  priv="$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
+  addr="$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
+  dns="$(sed -n 's/^DNS[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
+  spub="$(sed -n 's/^PublicKey[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
+  psk="$(sed -n 's/^PresharedKey[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
+  endpoint="$(sed -n 's/^Endpoint[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
+  allowed="$(sed -n 's/^AllowedIPs[[:space:]]*=[[:space:]]*//p' "$f" | head -1)"
+  local ehost="${endpoint%:*}" eport="${endpoint##*:}"
+  local addr_ip="${addr%%/*}" addr_cidr="$addr"
+  [ "$addr_cidr" = "${addr_cidr%/*}" ] && addr_cidr="$addr_ip/24"
+  # RouterOS wants the allowed-address list comma-joined with no spaces.
+  local allowed_mt="${allowed// /}"
+
+  echo
+  read -rp "Print a ready-to-paste connect snippet for the client? [1] MikroTik  [2] Ubuntu  [Enter] skip: " WANT
+  case "$WANT" in
+    1)
+      echo
+      echo "═══ MikroTik — paste into the client router's terminal ═══"
+      cat <<MT
+/interface wireguard add name=wg-securytik private-key="$priv" mtu=1420
+/ip address add address=$addr_cidr interface=wg-securytik
+/interface wireguard peers add interface=wg-securytik \\
+    public-key="$spub" preshared-key="$psk" \\
+    endpoint-address=$ehost endpoint-port=$eport \\
+    allowed-address=$allowed_mt persistent-keepalive=25s
+MT
+      # Full-tunnel needs a default route + NAT the router can't safely guess; flag it.
+      case "$allowed" in
+        *0.0.0.0/0*) echo "# Full tunnel: also route LAN out of wg-securytik, e.g." ;
+                     echo "#   /ip route add dst-address=0.0.0.0/0 gateway=wg-securytik" ;
+                     echo "#   /ip firewall nat add chain=srcnat out-interface=wg-securytik action=masquerade" ;;
+      esac
+      echo "═════════════════════════════════════════════════════════"
+      ;;
+    2)
+      echo
+      echo "═══ Ubuntu — paste into the client's shell (installs WireGuard if missing) ═══"
+      cat <<UB
+sudo bash -c '
+export DEBIAN_FRONTEND=noninteractive
+command -v wg >/dev/null || { apt-get update && apt-get install -y wireguard; }
+umask 077; mkdir -p /etc/wireguard
+cat > /etc/wireguard/wg-securytik.conf <<WGCONF
+[Interface]
+PrivateKey = $priv
+Address = $addr_cidr
+DNS = $dns
+[Peer]
+PublicKey = $spub
+PresharedKey = $psk
+Endpoint = $endpoint
+AllowedIPs = $allowed
+PersistentKeepalive = 25
+WGCONF
+systemctl enable --now wg-quick@wg-securytik
+sleep 2; wg show wg-securytik
+'
+UB
+      echo "════════════════════════════════════════════════════════════════════════════"
+      ;;
+    *) : ;;
+  esac
 }
 
 pick_client() {
