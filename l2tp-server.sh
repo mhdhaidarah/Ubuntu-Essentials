@@ -212,6 +212,20 @@ users_list() {
   mapfile -t USERS < <(awk -v s="$SRVNAME" '$2==s && $1 !~ /^#/ {print $1}' "$SECRETS" 2>/dev/null)
 }
 
+# Lowest address in the pool ($IPRANGE = BASE.10-BASE.200) not already pinned to one
+# of our users. Auto-pinning a fixed v4 is what gives every client a STABLE v6
+# (fc11::<v4-host>), so the connect snippet can always hand out the right address.
+next_free_ip() {
+  local lo hi base start end o used
+  lo="${IPRANGE%-*}"; hi="${IPRANGE#*-}"
+  base="${lo%.*}"; start="${lo##*.}"; end="${hi##*.}"
+  used="$(awk -v s="$SRVNAME" -v b="$base" '$2==s && $4 ~ ("^" b "\\.") {n=split($4,a,"."); print a[n]}' "$SECRETS" 2>/dev/null)"
+  for (( o=start; o<=end; o++ )); do
+    printf '%s\n' $used | grep -qx "$o" || { echo "$base.$o"; return; }
+  done
+  echo ""   # pool exhausted
+}
+
 add_user() {
   [ -f "$ENVF" ] || { echo "Set the server up first (option 1)."; return 1; }
   . "$ENVF"
@@ -220,9 +234,26 @@ add_user() {
   users_list
   printf '%s\n' "${USERS[@]}" | grep -qx "$U" && { echo "User '$U' already exists."; return 1; }
   while :; do read -rsp "Password: " P; echo; [ -n "$P" ] && break; echo "  Required."; done
-  read -rp "Pin a fixed VPN IP (Enter = any from the pool): " FIXED
 
-  printf '%s\t%s\t%s\t%s\n' "$U" "$SRVNAME" "$P" "${FIXED:-*}" >> "$SECRETS"
+  # Every user gets a STUCK (fixed) v4 by default so its v6 is stable too. Enter accepts
+  # the auto-picked next-free address; or type a specific one.
+  local NET="${SUBNET%.*}" DEF_IP; DEF_IP="$(next_free_ip)"
+  while :; do
+    if [ -n "$DEF_IP" ]; then
+      read -rp "Fixed VPN IP  [Enter = $DEF_IP]: " FIXED; FIXED="${FIXED:-$DEF_IP}"
+    else
+      read -rp "Fixed VPN IP  (pool full — type one in $NET.0/24): " FIXED
+    fi
+    case "$FIXED" in "$NET."[0-9]*) ;; *) echo "  Enter an address inside $NET.0/24 (e.g. $NET.10)."; continue ;; esac
+    local o="${FIXED##*.}"
+    if ! [ "$o" -ge 2 ] 2>/dev/null || [ "$o" -gt 254 ]; then echo "  Host part must be 2-254."; continue; fi
+    if awk -v s="$SRVNAME" -v ip="$FIXED" '$2==s && $4==ip{f=1} END{exit !f}' "$SECRETS"; then
+      echo "  $FIXED is already pinned to another user — pick a different one."; continue
+    fi
+    break
+  done
+
+  printf '%s\t%s\t%s\t%s\n' "$U" "$SRVNAME" "$P" "$FIXED" >> "$SECRETS"
   chmod 600 "$SECRETS"
   echo
   echo "Added '$U'. Client settings:"
@@ -231,7 +262,7 @@ add_user() {
   echo "    IPsec:    $( [ "$IPSEC" = yes ] && echo "PSK required" || echo "none (plain L2TP)" )"
   [ -n "$SUBNET6" ] && echo "    IPv6:     dual-stack (ULA $SUBNET6, NAT66)"
   echo "  No xl2tpd restart needed — pppd reads chap-secrets on each connect."
-  connect_snippet "$U" "$P" "${FIXED:-*}"
+  connect_snippet "$U" "$P" "$FIXED"
 }
 
 del_user() {
@@ -352,6 +383,9 @@ connect_snippet() {
         [ -n "$V6" ] && echo "/ipv6 address add address=$V6/64 interface=l2tp-securytik advertise=no" \
                      || echo "# IPv6: pin this user to a fixed IP to get a stable v6; then fc11::<host>"
         echo "/ipv6 route add dst-address=::/0 gateway=l2tp-securytik"
+        # Stop this router from advertising itself on the tunnel (else it can inject a
+        # default route into the SERVER and cost the server its own internet).
+        echo "/ipv6 nd add interface=l2tp-securytik ra-lifetime=0s"
       fi
       echo "═════════════════════════════════════════════════════════"
       ;;
