@@ -14,7 +14,7 @@ B=$'\033[1m'; DIM=$'\033[2m'; CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\03
 
 # group|file|title|description   — mirrors the SICO Ubuntu catalog
 ITEMS=(
-  "System & maintenance|update-upgrade.sh|Update & upgrade|Update, full-upgrade, autoremove, then release-upgrade."
+  "System & maintenance|update-upgrade.sh|Update & upgrade|Update, full-upgrade, autoremove, turn on automatic security updates, then release-upgrade."
   "System & maintenance|hostname.sh|Set hostname|Set the hostname and keep /etc/hosts in sync."
   "System & maintenance|time-date.sh|Timezone & NTP|Pick a timezone and enable NTP time sync."
   "System & maintenance|disk-show.sh|Show disk usage|List mounted filesystems and free space."
