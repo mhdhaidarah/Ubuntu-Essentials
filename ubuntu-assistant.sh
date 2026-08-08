@@ -28,6 +28,10 @@ ITEMS=(
   "VPN & uplinks|wireguard-client.sh|WireGuard client|Add/remove WireGuard tunnels, enable on boot."
   "VPN & uplinks|wireguard-server.sh|WireGuard server|Serve peers: add/remove, QR configs, NAT them online."
   "VPN & uplinks|pppoe-client.sh|PPPoE client|Add/remove a persistent PPPoE dialer."
+  "Login & access|user-manage.sh|Users & sudo|Add/delete users, grant or revoke sudo, see who is online."
+  "Login & access|ssh-key-create.sh|Create an SSH key|Generate an ed25519 keypair and print how to install it."
+  "Login & access|ssh-key-add.sh|Add an SSH key|Paste a public key into a user's authorized_keys."
+  "Login & access|ssh-key-list.sh|Show / remove SSH keys|List authorized keys by fingerprint and remove any of them."
   "File sharing|smb-client.sh|Mount SMB share|Mount a CIFS share with credentials + automount."
   "File sharing|sshfs-client.sh|Mount SSHFS path|Mount a remote path over SSHFS (key-based)."
   "File sharing|share-server.sh|SMB + SSHFS file server|Turn this box into a file server with per-share users."
@@ -54,22 +58,48 @@ for i in "${!ITEMS[@]}"; do
 done
 
 echo
+
 read -rp "  Pick a number (q to quit): " CHOICE
-[ "$CHOICE" = "q" ] || [ "$CHOICE" = "Q" ] || [ -z "$CHOICE" ] && { echo "  Nothing to do."; exit 0; }
 
-case "$CHOICE" in
-  ''|*[!0-9]*) echo "${RED}  Not a number.${R}"; exit 1 ;;
+# No `exit` and no `return` anywhere below. Quitting used to log people out:
+# a bare `exit` closes the caller's SHELL whenever the assistant is sourced or
+# exec'd into, and wrapping it in a helper does not help either — `return`
+# inside a function returns from the FUNCTION, so execution simply fell through
+# and ran whatever item happened to be at that index. Instead the choice only
+# sets RUN, and the script ends by reaching its last line, which is safe however
+# it was invoked.
+#
+# A case, not `[ ] || [ ] && { }`: that chain groups as ((A||B)||C)&&D, so one
+# reordering silently makes the quit branch fire on a valid choice.
+RUN=""
+case "${CHOICE:-}" in
+  q|Q|"")   echo "  Nothing to do." ;;
+  *[!0-9]*) echo "${RED}  Not a number.${R}" ;;
+  *)
+    IDX=$((CHOICE-1))
+    if [ "$IDX" -lt 0 ] || [ "$IDX" -ge "${#ITEMS[@]}" ]; then
+      echo "${RED}  No such item.${R}"
+    else
+      RUN=1
+    fi
+    ;;
 esac
-IDX=$((CHOICE-1))
-[ "$IDX" -lt 0 ] || [ "$IDX" -ge "${#ITEMS[@]}" ] && { echo "${RED}  No such item.${R}"; exit 1; }
 
-IFS='|' read -r group file title desc <<< "${ITEMS[$IDX]}"
-echo
-echo "  ${B}$title${R}"
-echo "  ${DIM}running $RAW/$file${R}"
-echo
+if [ -n "$RUN" ]; then
+  IFS='|' read -r group file title desc <<< "${ITEMS[$IDX]}"
+  echo
+  echo "  ${B}$title${R}"
+  echo "  ${DIM}running $RAW/$file${R}"
+  echo
 
-# Hand the terminal straight to the chosen snippet — identical to pasting its own
-# one-liner. Process substitution (not a pipe) keeps stdin on the keyboard, so the
-# snippet's own prompts still work; each snippet calls sudo itself where it needs root.
-exec bash <(curl -fsSL "$RAW/$file")
+  # Hand the terminal to the chosen snippet — identical to pasting its own
+  # one-liner. Process substitution (not a pipe) keeps stdin on the keyboard so
+  # the snippet's own prompts still work; each snippet calls sudo itself where
+  # it needs root.
+  #
+  # NOT `exec`: that replaced the assistant's process, so control never came
+  # back here, and any snippet ending in `exec bash` (hostname.sh does, to pick
+  # up the new name) replaced it again — between them they consumed the shell
+  # the user started from. As a child it just returns here.
+  bash <(curl -fsSL "$RAW/$file")
+fi
