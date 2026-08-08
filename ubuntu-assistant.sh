@@ -14,12 +14,19 @@ B=$'\033[1m'; DIM=$'\033[2m'; CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\03
 
 # group|file|title|description   — mirrors the SICO Ubuntu catalog
 ITEMS=(
+  "System & maintenance|server-triage.sh|Server health triage|What is wrong with this box: load, memory, disk, failed units, OOM kills, errors."
+  "System & maintenance|disk-rescue.sh|Disk space rescue|Find what filled the disk and reclaim it — journal, apt, old kernels, Docker."
+  "System & maintenance|swap-setup.sh|Swap / zram|Add a swap file or zram, remove one, tune swappiness."
+  "System & maintenance|backup-restore.sh|Backup & restore|Archive /etc /root /home /opt somewhere else, schedule it, restore from it."
   "System & maintenance|update-upgrade.sh|Update & upgrade|Update, full-upgrade, autoremove, turn on automatic security updates, then release-upgrade."
   "System & maintenance|hostname.sh|Set hostname|Set the hostname and keep /etc/hosts in sync."
   "System & maintenance|time-date.sh|Timezone & NTP|Pick a timezone and enable NTP time sync."
   "System & maintenance|disk-show.sh|Show disk usage|List mounted filesystems and free space."
   "System & maintenance|disk-extend-100.sh|Extend root disk to 100%|Grow the root LVM volume to fill the disk."
   "System & maintenance|python-install.sh|Install Python toolchain|Python 3 + pip/venv + build tools."
+  "Networking|firewall.sh|Firewall (ufw)|Open/close ports with presets, and it refuses to lock you out of SSH."
+  "Networking|net-diag.sh|Network diagnostics|Loss and jitter, mtr, per-resolver DNS timing, MTU discovery, port reachability."
+  "Networking|dns-setup.sh|DNS resolver wizard|Which layer actually owns your DNS, set it, test it, put it back."
   "Networking|network-ip.sh|Netplan IP wizard|Set IPv4/IPv6 (DHCP/static/SLAAC) + DNS, with safe-apply."
   "Networking|speedtest.sh|Internet speed test|Run a speed test, optionally bound to one uplink."
   "VPN & uplinks|l2tp-client-once.sh|L2TP client (temporary)|One-shot support tunnel. Lives in /tmp, gone on reboot."
@@ -36,6 +43,8 @@ ITEMS=(
   "File sharing|smb-client.sh|Mount SMB share|Mount a CIFS share with credentials + automount."
   "File sharing|sshfs-client.sh|Mount SSHFS path|Mount a remote path over SSHFS (key-based)."
   "File sharing|share-server.sh|SMB + SSHFS file server|Turn this box into a file server with per-share users."
+  "SAMM|samm-install.sh|Install SAMM|Pre-flight this box, then run the official installer for the latest release."
+  "SAMM|samm-health.sh|SAMM health check|Read-only diagnosis: services, database, FreeRADIUS, panel, error board."
   "Apps & services|docker-compose.sh|Docker + Compose|Install Docker Engine + the Compose plugin."
   "Apps & services|cloudflared-install.sh|Cloudflare Tunnel|Install cloudflared from Cloudflare's apt repo."
   "Apps & services|webmin-install.sh|Webmin panel|Install the Webmin web admin panel."
@@ -48,19 +57,50 @@ echo "${CYAN}  Ubuntu Assistant${R} ${DIM}— Ubuntu Essentials, one pick away${
 echo "${DIM}  sico.securytik.com · github.com/mhdhaidarah/Ubuntu-Essentials${R}"
 echo
 
-LAST_GROUP=""
+# Two columns, titles only. One line per item with its description was fine at
+# 20 entries and unreadable past 40 — the list scrolled off the top of the
+# terminal before you reached the prompt. Descriptions are still one keystroke
+# away: `?N` prints the full entry for N. Narrow terminals fall back to one
+# column, because wrapped columns are worse than a long list.
+COLS=2
+[ "${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}" -lt 76 ] && COLS=1
+
+LAST_GROUP=""; col=0
 for i in "${!ITEMS[@]}"; do
   IFS='|' read -r group file title desc <<< "${ITEMS[$i]}"
   if [ "$group" != "$LAST_GROUP" ]; then
+    [ "$col" -ne 0 ] && { echo; col=0; }          # finish a half-filled row
+    echo
     echo "  ${B}$group${R}"
     LAST_GROUP="$group"
   fi
-  printf "    ${GREEN}%2d${R}) %-26s ${DIM}%s${R}\n" "$((i+1))" "$title" "$desc"
+  printf "    ${GREEN}%2d${R}) %-30s" "$((i+1))" "$title"
+  col=$((col+1))
+  [ "$col" -ge "$COLS" ] && { echo; col=0; }
 done
+[ "$col" -ne 0 ] && echo
 
 echo
 
+echo
+echo "  ${DIM}?N shows what an entry does (e.g. ?15)${R}"
 read -rp "  Pick a number (q to quit): " CHOICE
+
+# `?N` — show the full description for one entry, then stop. Keeps the menu
+# compact without hiding what anything actually does.
+case "${CHOICE:-}" in
+  \?[0-9]*)
+    n="${CHOICE#\?}"
+    if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "${#ITEMS[@]}" ]; then
+      IFS='|' read -r group file title desc <<< "${ITEMS[$((n-1))]}"
+      echo; echo "  ${B}$title${R}  ${DIM}($group)${R}"
+      echo "  $desc"
+      echo "  ${DIM}$RAW/$file${R}"; echo
+    else
+      echo "  ${RED}No such item.${R}"
+    fi
+    CHOICE="" ;;
+esac
 
 # No `exit` and no `return` anywhere below. Quitting used to log people out:
 # a bare `exit` closes the caller's SHELL whenever the assistant is sourced or
