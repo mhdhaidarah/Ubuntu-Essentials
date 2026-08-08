@@ -28,6 +28,7 @@ ITEMS=(
   "VPN & uplinks|wireguard-client.sh|WireGuard client|Add/remove WireGuard tunnels, enable on boot."
   "VPN & uplinks|wireguard-server.sh|WireGuard server|Serve peers: add/remove, QR configs, NAT them online."
   "VPN & uplinks|pppoe-client.sh|PPPoE client|Add/remove a persistent PPPoE dialer."
+  "Login & access|ssh-control.sh|SSH server control|Install/restore sshd, root-login policy, and password vs key login — with lockout guards."
   "Login & access|user-manage.sh|Users & sudo|Add/delete users, grant or revoke sudo, see who is online."
   "Login & access|ssh-key-create.sh|Create an SSH key|Generate an ed25519 keypair and print how to install it."
   "Login & access|ssh-key-add.sh|Add an SSH key|Paste a public key into a user's authorized_keys."
