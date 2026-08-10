@@ -55,6 +55,10 @@ show() {
   printf "  %-26s %s\n" "PasswordAuthentication:" "$(eff passwordauthentication)"
   printf "  %-26s %s\n" "PubkeyAuthentication:" "$(eff pubkeyauthentication)"
   printf "  %-26s %s\n" "KbdInteractive:" "$(eff kbdinteractiveauthentication)"
+  # 'any' is the default and means "one accepted method is enough". Anything
+  # else is a REQUIRED chain, and it overrides the two switches above: with
+  # publickey,password set, PasswordAuthentication yes on its own gets nobody in.
+  printf "  %-26s %s\n" "Required chain:" "$(eff_all authenticationmethods)"
   printf "  %-26s %s\n" "ClientAliveInterval:" "$(eff clientaliveinterval)"
   printf "  %-26s %s\n" "ClientAliveCountMax:" "$(eff clientalivecountmax)"
   # Every one of these MUST end in `|| true`. This function runs under `set -e`,
@@ -87,6 +91,33 @@ key_users() {
     echo "    $u ($(grep -cvE '^\s*($|#)' "$f") key(s))"
     n=$((n+1))
   done
+  return $((n==0))
+}
+
+# A key alone is not enough for the both-required model: sshd also has to be
+# able to accept a PASSWORD for the account. Cloud images ship `ubuntu` (and
+# often root) with `!` in /etc/shadow — locked. Demanding a password from an
+# account that has none is a locked door with extra steps.
+has_password() { [ "$(passwd -S "$1" 2>/dev/null | awk '{print $2}')" = "P" ]; }
+
+# Who survives "key AND password"? Prints every key-holder, flagging the ones
+# that would still be refused, and fails if not a single account qualifies.
+both_ready() {
+  local u f n=0 seen=0
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -f "$f" ] || continue
+    grep -qvE '^\s*($|#)' "$f" 2>/dev/null || continue
+    u=$(echo "$f" | awk -F/ '{print ($2=="root")?"root":$3}')
+    seen=$((seen+1))
+    if has_password "$u"; then
+      echo "    $u (key + password — OK)"; n=$((n+1))
+    else
+      echo "    $u (key, but NO usable password — would be REFUSED)"
+    fi
+  done
+  # The caller must not append its own "(none)": listing a flagged account and
+  # then "(none)" underneath reads as two contradictory answers.
+  [ "$seen" -eq 0 ] && echo "    (no authorized keys anywhere on this system)"
   return $((n==0))
 }
 
@@ -215,15 +246,23 @@ root_access() {
 # ============================ 4. login model =================================
 login_model() {
   echo
-  echo "Currently: password=$(eff passwordauthentication)  pubkey=$(eff pubkeyauthentication)"
+  echo "Currently: password=$(eff passwordauthentication)  pubkey=$(eff pubkeyauthentication)  required=$(eff_all authenticationmethods)"
   echo
   echo "  1) Password only"
-  echo "  2) Key only          (most secure)"
-  echo "  3) Password or key   (either one gets you in)"
+  echo "  2) Key only              (most secure single factor)"
+  echo "  3) Password or key       (either one gets you in)"
+  echo "  4) Key AND password      (BOTH required — two-factor lockdown)"
   echo "  Enter) cancel"
   read -rp "Choice: " M
+  # KB = KbdInteractive, the quieter second password path: it follows the
+  # password setting, except under lockdown where the chain names 'password'
+  # explicitly and a second prompt path would only confuse clients.
+  local PW PK KB AM ROOTFIX=""
   case "$M" in
-    1) PW=yes; PK=no  ;; 2) PW=no;  PK=yes ;; 3) PW=yes; PK=yes ;;
+    1) PW=yes; PK=no;  KB=yes; AM=any ;;
+    2) PW=no;  PK=yes; KB=no;  AM=any ;;
+    3) PW=yes; PK=yes; KB=yes; AM=any ;;
+    4) PW=yes; PK=yes; KB=no;  AM="publickey,password" ;;
     *) echo "Unchanged."; return ;;
   esac
   if [ "$PW" = "no" ]; then
@@ -247,11 +286,71 @@ login_model() {
     read -rp "Continue? [y/N]: " C
     [ "$C" = "y" ] || [ "$C" = "Y" ] || { echo "Aborted."; return; }
   fi
-  # KbdInteractive follows PasswordAuthentication: left on, it is a second and
-  # quieter password path, so "key only" would not actually be key only.
-  set_directives "PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication" \
-    "PasswordAuthentication $PW" "PubkeyAuthentication $PK" "KbdInteractiveAuthentication $PW" \
-    && echo "Now: password=$(eff passwordauthentication)  pubkey=$(eff pubkeyauthentication)"
+  if [ "$AM" != "any" ]; then
+    echo
+    echo "LOCKDOWN: from then on every login must present a KEY *and then* the"
+    echo "account's password. Either one alone is refused — including for people"
+    echo "who have only ever used a password, and for automation that logs in"
+    echo "with a key and no password (scp, rsync, backups, Ansible, sshfs)."
+    echo
+    # Password auth on Ubuntu's sshd goes through PAM; without it the second
+    # stage can never succeed, so the chain would refuse everybody.
+    if [ "$(eff usepam)" = "no" ]; then
+      echo "REFUSING: UsePAM is off on this machine, so sshd cannot run the"
+      echo "password stage at all — the chain would lock out every account."
+      echo "Set 'UsePAM yes' first, then come back."
+      return
+    fi
+    echo "Accounts that can still get in afterwards:"
+    if ! both_ready; then
+      echo
+      echo "REFUSING: no account holds both an authorized key and a usable"
+      echo "password. Add a key (ssh-key-add.sh) and set a password"
+      echo "(passwd <user>) first, then come back."
+      return
+    fi
+    # root is the classic casualty. 'prohibit-password' denies root the second
+    # stage, so a correct key AND a correct password still fail — for root only,
+    # which looks like a broken password rather than a policy.
+    if [ "$(eff permitrootlogin)" = "prohibit-password" ] \
+       && grep -qvE '^\s*($|#)' /root/.ssh/authorized_keys 2>/dev/null; then
+      echo
+      echo "NOTE: PermitRootLogin is 'prohibit-password', which refuses root the"
+      echo "password stage — root would fail even with the right key AND password."
+      echo "Under this policy 'yes' is still key-first: a password alone gets"
+      echo "nobody in, root included."
+      read -rp "Set PermitRootLogin to yes as well? [y/N]: " C
+      # `A || B && C` returns B's status when the answer is "no", and this
+      # script runs under `set -e` — as a bare list that would abort the whole
+      # menu on a plain Enter. An if-block cannot.
+      if [ "$C" = "y" ] || [ "$C" = "Y" ]; then ROOTFIX=yes; fi
+    fi
+    echo
+    read -rp "Type LOCKDOWN to confirm: " C
+    [ "$C" = "LOCKDOWN" ] || { echo "Aborted."; return; }
+  fi
+  # AuthenticationMethods is rewritten by EVERY choice, not just option 4.
+  # Leaving a stale 'publickey,password' behind while switching back to
+  # "password only" would keep demanding a key that the menu says is off.
+  local KW="PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication|AuthenticationMethods"
+  local -a D=("PasswordAuthentication $PW" "PubkeyAuthentication $PK" \
+              "KbdInteractiveAuthentication $KB" "AuthenticationMethods $AM")
+  if [ "$ROOTFIX" = "yes" ]; then
+    # PermitRootLogin only joins the keyword list when we are actually setting
+    # it — set_directives DROPS every keyword it is given and writes back only
+    # what follows, so naming it otherwise would silently reset root policy.
+    set_directives "$KW|PermitRootLogin" "${D[@]}" "PermitRootLogin yes" || return
+  else
+    set_directives "$KW" "${D[@]}" || return
+  fi
+  echo "Now: password=$(eff passwordauthentication)  pubkey=$(eff pubkeyauthentication)  required=$(eff_all authenticationmethods)"
+  if [ "$AM" != "any" ]; then
+    echo
+    echo "Test it from another terminal BEFORE closing this session:"
+    echo "    ssh -o PreferredAuthentications=publickey $(logname 2>/dev/null || echo root)@<this-host>"
+    echo "must be REFUSED, and a normal ssh must ask for the password after the"
+    echo "key. If anything is wrong, run this menu again and pick 3."
+  fi
 }
 
 # ============================ 5. port ========================================
@@ -535,7 +634,7 @@ echo
 echo "   1) Install / enable the SSH server"
 echo "   2) Restore the default SSH configuration"
 echo "   3) Root login policy"
-echo "   4) Login method (password / key / both)"
+echo "   4) Login method (password / key / either / both required)"
 echo "   5) Change the SSH port"
 echo "   6) Brute-force protection (fail2ban)"
 echo "   7) Restrict who may log in"

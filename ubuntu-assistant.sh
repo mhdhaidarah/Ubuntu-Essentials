@@ -35,7 +35,7 @@ ITEMS=(
   "VPN & uplinks|wireguard-client.sh|WireGuard client|Add/remove WireGuard tunnels, enable on boot."
   "VPN & uplinks|wireguard-server.sh|WireGuard server|Serve peers: add/remove, QR configs, NAT them online."
   "VPN & uplinks|pppoe-client.sh|PPPoE client|Add/remove a persistent PPPoE dialer."
-  "Login & access|ssh-control.sh|SSH server control|Port, root policy, password vs key, fail2ban, allow-list, idle timeout, host keys, backups."
+  "Login & access|ssh-control.sh|SSH server control|Port, root policy, password / key / both-required lockdown, fail2ban, allow-list, idle timeout, host keys, backups."
   "Login & access|user-manage.sh|Users & sudo|Add/delete users, grant or revoke sudo, see who is online."
   "Login & access|ssh-key-create.sh|Create an SSH key|Generate an ed25519 keypair and print how to install it."
   "Login & access|ssh-key-add.sh|Add an SSH key|Paste a public key into a user's authorized_keys."
@@ -52,9 +52,82 @@ ITEMS=(
 
 command -v curl >/dev/null || { echo "${RED}curl is required.${R}"; exit 1; }
 
+# --- make it a permanent command --------------------------------------------
+# Pasting a curl URL every time is the whole friction this removes: the first
+# run drops a tiny launcher on the box, so afterwards the menu is one word.
+# The launcher re-fetches the menu on every run rather than caching this file,
+# so a machine that was set up once never shows a stale, half-broken catalog.
+LAUNCHER_NAME="ubuntu-assistant"
+URL="https://sico.securytik.com/ubuntu"
+
+launcher_body() {
+  cat <<LAUNCH
+#!/usr/bin/env bash
+# Ubuntu Assistant — installed launcher. Fetches the current menu each run, so
+# this file never goes stale. Remove it with: rm \$0
+URL="$URL"
+T=\$(mktemp) || exit 1
+trap 'rm -f "\$T"' EXIT
+# Download FIRST, then run. \`bash <(curl ...)\` hands bash an empty stream when
+# the network is down and looks like a menu that silently did nothing.
+if ! curl -fsSL "\$URL" -o "\$T" || [ ! -s "\$T" ]; then
+  echo "Ubuntu Assistant: could not reach \$URL — check the network and retry."
+  exit 1
+fi
+UA_VIA_LAUNCHER=1 bash "\$T"
+LAUNCH
+}
+
+install_launcher() {
+  local dir="/usr/local/bin" tgt
+  if [ ! -w "$dir" ] && [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+      tgt="$dir/$LAUNCHER_NAME"
+      launcher_body | sudo tee "$tgt" >/dev/null 2>&1 && sudo chmod 755 "$tgt" && { echo "$tgt"; return 0; }
+    fi
+    # No root and no passwordless sudo: a personal copy beats nagging for a
+    # password just to save some typing later.
+    dir="$HOME/.local/bin"; mkdir -p "$dir" 2>/dev/null || return 1
+  fi
+  tgt="$dir/$LAUNCHER_NAME"
+  launcher_body > "$tgt" 2>/dev/null || return 1
+  chmod 755 "$tgt" 2>/dev/null
+  echo "$tgt"
+}
+
+# Seed the shell's history so the literal "press up, press enter" works in the
+# NEXT login too, not only in this one. The running shell keeps history in
+# memory and flushes it on exit, so we append to the file and let it merge —
+# Ubuntu's stock bashrc sets `histappend`, which is what makes that safe. When
+# the assistant is run under sudo, $HOME is root's; the history the user will
+# actually arrow through is $SUDO_USER's.
+seed_history() {
+  local h u="${SUDO_USER:-}"
+  if [ -n "$u" ] && [ "$u" != "root" ]; then h=$(getent passwd "$u" | cut -d: -f6)/.bash_history
+  else h="$HOME/.bash_history"; fi
+  [ -e "$h" ] || return 0
+  [ -w "$h" ] || return 0
+  grep -qxF "$LAUNCHER_NAME" "$h" 2>/dev/null && return 0
+  printf '%s\n' "$LAUNCHER_NAME" >> "$h" 2>/dev/null || true
+}
+
+# Installing on EVERY run, launcher or not, is deliberate: it is idempotent, and
+# it is the only way a box set up months ago picks up a fixed launcher. Only the
+# advertising is suppressed for people already using it.
+LAUNCHER_PATH=$(install_launcher) || LAUNCHER_PATH=""
+[ -n "$LAUNCHER_PATH" ] && seed_history
+[ "${UA_VIA_LAUNCHER:-}" = "1" ] && LAUNCHER_PATH=""
+
 echo
 echo "${CYAN}  Ubuntu Assistant${R} ${DIM}— Ubuntu Essentials, one pick away${R}"
 echo "${DIM}  sico.securytik.com · github.com/mhdhaidarah/Ubuntu-Essentials${R}"
+if [ -n "$LAUNCHER_PATH" ]; then
+  echo "${DIM}  next time just type${R} ${GREEN}$LAUNCHER_NAME${R} ${DIM}(or press ↑) — installed at $LAUNCHER_PATH${R}"
+  case ":$PATH:" in
+    *":$(dirname "$LAUNCHER_PATH"):"*) ;;
+    *) echo "${DIM}  ($(dirname "$LAUNCHER_PATH") is not on your PATH yet — log out and back in)${R}" ;;
+  esac
+fi
 echo
 
 # Two columns, titles only. One line per item with its description was fine at
