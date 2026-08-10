@@ -9,6 +9,10 @@
 set -uo pipefail
 
 RAW="https://raw.githubusercontent.com/mhdhaidarah/Ubuntu-Essentials/main"
+# One request for the whole repo instead of 35. A machine behind a slow link
+# used to spend a minute fetching snippets one at a time.
+TARBALL="https://codeload.github.com/mhdhaidarah/Ubuntu-Essentials/tar.gz/refs/heads/main"
+CACHE_MAX_AGE_DAYS=7
 
 B=$'\033[1m'; DIM=$'\033[2m'; CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; R=$'\033[0m'
 
@@ -52,6 +56,70 @@ ITEMS=(
 
 command -v curl >/dev/null || { echo "${RED}curl is required.${R}"; exit 1; }
 
+# --- offline copy ------------------------------------------------------------
+# Most snippets here are pure local configuration — SSH, IP, DNS, users, disks,
+# health. They have no business needing the internet at run time, so the first
+# run copies EVERY snippet onto the box and later runs read from there. What a
+# snippet does with the network afterwards is its own affair: apt-get still
+# needs a mirror, samm-install.sh still needs the release.
+cache_dir() {
+  if [ "$(id -u)" -eq 0 ] || [ -w /usr/local/share ]; then
+    echo "/usr/local/share/ubuntu-essentials"
+  else
+    echo "${XDG_DATA_HOME:-$HOME/.local/share}/ubuntu-essentials"
+  fi
+}
+CACHE=$(cache_dir)
+
+cache_count() { ls "$CACHE"/*.sh 2>/dev/null | wc -l; }
+
+cache_age_days() {
+  [ -f "$CACHE/.stamp" ] || { echo 9999; return; }
+  local then now
+  then=$(cat "$CACHE/.stamp" 2>/dev/null) || then=0
+  now=$(date +%s)
+  echo $(( (now - ${then:-0}) / 86400 ))
+}
+
+# Land each file with a rename, never a partial write. A truncated snippet in
+# the cache is worse than no cache at all: it runs happily and stops half way
+# through reconfiguring your network.
+cache_put() {
+  local name="$1" src="$2"
+  head -c2 "$src" 2>/dev/null | grep -q '#!' || return 1   # not a script; skip
+  cp "$src" "$CACHE/.new.$name" 2>/dev/null || return 1
+  chmod 644 "$CACHE/.new.$name" 2>/dev/null
+  mv -f "$CACHE/.new.$name" "$CACHE/$name" 2>/dev/null
+}
+
+# Whole repo in one tarball, with a per-file fetch as the fallback: a network
+# that blocks codeload but allows raw.githubusercontent is common enough on
+# corporate links, and one blocked host should not cost the offline copy.
+refresh_cache() {
+  mkdir -p "$CACHE" 2>/dev/null || return 1
+  local tmp n=0 f
+  tmp=$(mktemp -d) || return 1
+  if curl -fsSL --connect-timeout 8 --max-time 120 -o "$tmp/repo.tgz" "$TARBALL" 2>/dev/null \
+     && [ -s "$tmp/repo.tgz" ] && tar xzf "$tmp/repo.tgz" -C "$tmp" 2>/dev/null; then
+    local src; src=$(find "$tmp" -maxdepth 1 -type d -name 'Ubuntu-Essentials-*' 2>/dev/null | head -1)
+    if [ -n "$src" ]; then
+      for f in "$src"/*.sh; do [ -f "$f" ] || continue
+        cache_put "$(basename "$f")" "$f" && n=$((n+1)); done
+    fi
+  fi
+  if [ "$n" -eq 0 ]; then
+    for item in "${ITEMS[@]}" "x|ubuntu-assistant.sh|x|x"; do
+      IFS='|' read -r _ f _ _ <<< "$item"
+      curl -fsSL --connect-timeout 8 -o "$tmp/$f" "$RAW/$f" 2>/dev/null \
+        && cache_put "$f" "$tmp/$f" && n=$((n+1))
+    done
+  fi
+  rm -rf "$tmp"
+  [ "$n" -eq 0 ] && return 1
+  date +%s > "$CACHE/.stamp" 2>/dev/null
+  echo "$n"
+}
+
 # --- make it a permanent command --------------------------------------------
 # Pasting a curl URL every time is the whole friction this removes: the first
 # run drops a tiny launcher on the box, so afterwards the menu is one word.
@@ -70,8 +138,14 @@ T=\$(mktemp) || exit 1
 trap 'rm -f "\$T"' EXIT
 # Download FIRST, then run. \`bash <(curl ...)\` hands bash an empty stream when
 # the network is down and looks like a menu that silently did nothing.
-if ! curl -fsSL "\$URL" -o "\$T" || [ ! -s "\$T" ]; then
-  echo "Ubuntu Assistant: could not reach \$URL — check the network and retry."
+if ! curl -fsSL --connect-timeout 8 "\$URL" -o "\$T" 2>/dev/null || [ ! -s "\$T" ]; then
+  # Offline: run the copy the assistant left on this box. Losing the menu is
+  # the one failure that would make the whole offline copy pointless.
+  for C in "/usr/local/share/ubuntu-essentials/ubuntu-assistant.sh" \\
+           "\${XDG_DATA_HOME:-\$HOME/.local/share}/ubuntu-essentials/ubuntu-assistant.sh"; do
+    [ -r "\$C" ] && { UA_VIA_LAUNCHER=1 exec bash "\$C"; }
+  done
+  echo "Ubuntu Assistant: no network and no offline copy on this machine."
   exit 1
 fi
 UA_VIA_LAUNCHER=1 bash "\$T"
@@ -118,9 +192,26 @@ LAUNCHER_PATH=$(install_launcher) || LAUNCHER_PATH=""
 [ -n "$LAUNCHER_PATH" ] && seed_history
 [ "${UA_VIA_LAUNCHER:-}" = "1" ] && LAUNCHER_PATH=""
 
+# First run seeds the copy; after that only a stale one is refreshed, and a
+# refresh that fails is silent — the whole point is that the box keeps working
+# without the network, so a failed update must never block the menu.
+CACHE_NOTE=""
+if [ "$(cache_count)" -eq 0 ]; then
+  echo "  ${DIM}first run — copying every snippet to $CACHE for offline use...${R}"
+  CACHED=$(refresh_cache) || CACHED=""
+  if [ -n "$CACHED" ]; then CACHE_NOTE="offline copy: $CACHED snippets in $CACHE"
+  else CACHE_NOTE="${RED}no offline copy — could not download the snippets${R}"; fi
+elif [ "$(cache_age_days)" -ge "$CACHE_MAX_AGE_DAYS" ]; then
+  CACHED=$(refresh_cache) || CACHED=""
+  CACHE_NOTE="offline copy: $(cache_count) snippets in $CACHE"
+else
+  CACHE_NOTE="offline copy: $(cache_count) snippets, $(cache_age_days)d old"
+fi
+
 echo
 echo "${CYAN}  Ubuntu Assistant${R} ${DIM}— Ubuntu Essentials, one pick away${R}"
 echo "${DIM}  sico.securytik.com · github.com/mhdhaidarah/Ubuntu-Essentials${R}"
+[ -n "$CACHE_NOTE" ] && echo "${DIM}  $CACHE_NOTE${R}"
 if [ -n "$LAUNCHER_PATH" ]; then
   echo "${DIM}  next time just type${R} ${GREEN}$LAUNCHER_NAME${R} ${DIM}(or press ↑) — installed at $LAUNCHER_PATH${R}"
   case ":$PATH:" in
@@ -156,8 +247,16 @@ done
 echo
 
 echo
-echo "  ${DIM}?N shows what an entry does (e.g. ?15)${R}"
+echo "  ${DIM}?N shows what an entry does (e.g. ?15) · r re-downloads the offline copy${R}"
 read -rp "  Pick a number (q to quit): " CHOICE
+
+case "${CHOICE:-}" in
+  r|R)
+    echo "  ${DIM}refreshing from the repo...${R}"
+    if CACHED=$(refresh_cache); then echo "  ${GREEN}offline copy updated — $CACHED snippets.${R}"
+    else echo "  ${RED}Could not reach the repo. The existing copy is untouched.${R}"; fi
+    CHOICE="" ;;
+esac
 
 # `?N` — show the full description for one entry, then stop. Keeps the menu
 # compact without hiding what anything actually does.
@@ -203,17 +302,30 @@ if [ -n "$RUN" ]; then
   IFS='|' read -r group file title desc <<< "${ITEMS[$IDX]}"
   echo
   echo "  ${B}$title${R}"
-  echo "  ${DIM}running $RAW/$file${R}"
-  echo
 
-  # Hand the terminal to the chosen snippet — identical to pasting its own
-  # one-liner. Process substitution (not a pipe) keeps stdin on the keyboard so
-  # the snippet's own prompts still work; each snippet calls sudo itself where
-  # it needs root.
+  # The local copy first, and the network only when there isn't one. This is
+  # what makes ssh-control, network-ip, dns-setup and the rest usable on a box
+  # with no route out — which is exactly the box you are usually fixing.
   #
   # NOT `exec`: that replaced the assistant's process, so control never came
   # back here, and any snippet ending in `exec bash` (hostname.sh does, to pick
   # up the new name) replaced it again — between them they consumed the shell
   # the user started from. As a child it just returns here.
-  bash <(curl -fsSL "$RAW/$file")
+  if [ -r "$CACHE/$file" ]; then
+    echo "  ${DIM}running $CACHE/$file${R}"; echo
+    bash "$CACHE/$file"
+  else
+    echo "  ${DIM}running $RAW/$file${R}"; echo
+    # Download, then run. Process substitution hands bash an EMPTY stream when
+    # the fetch fails, which looks exactly like a snippet that did nothing.
+    T=$(mktemp)
+    if curl -fsSL --connect-timeout 8 -o "$T" "$RAW/$file" && [ -s "$T" ]; then
+      cache_put "$file" "$T"        # next time it is here, network or not
+      bash "$T"
+    else
+      echo "  ${RED}Not in the offline copy and the repo is unreachable.${R}"
+      echo "  ${DIM}Connect once and pick r to download the snippets.${R}"
+    fi
+    rm -f "$T"
+  fi
 fi

@@ -30,9 +30,27 @@ paste the URL again:
 ubuntu-assistant          # or just press ↑ and Enter
 ```
 
-<sub>It installs to `/usr/local/bin` (or `~/.local/bin` without root) and re-fetches
-the current menu every run, so it can't go stale. Remove it with
+<sub>It installs to `/usr/local/bin` (or `~/.local/bin` without root). Remove it with
 `sudo rm /usr/local/bin/ubuntu-assistant`.</sub>
+
+### It works offline
+
+That same first run copies **every snippet** to
+`/usr/local/share/ubuntu-essentials` (`~/.local/share/…` without root) — about
+**520 KB** of shell, no packages. From then on the menu and the snippets are read
+from disk, so the box needs no network to run them:
+
+- **Fully offline**: `ssh-control`, `network-ip`, `dns-setup`, `firewall`,
+  `server-triage`, `user-manage`, the `ssh-key-*` trio, `disk-show`,
+  `disk-rescue`, `swap-setup`, `hostname`, `time-date` — the local-configuration
+  tools you reach for precisely when the box has no route out.
+- **Still needs the network**, because of what they *install*, not how they are
+  fetched: `docker-compose`, `webmin-install`, `cloudflared-install`,
+  `python-install`, `update-upgrade`, the VPN wizards, and `samm-install`.
+
+The copy refreshes itself when it is more than 7 days old, and `r` at the menu
+prompt updates it on demand. A refresh that fails leaves the working copy exactly
+as it was — the offline copy is never worse for having tried.
 
 <sub>Prefer the long way? It's the same file:
 `bash <(curl -fsSL https://raw.githubusercontent.com/mhdhaidarah/Ubuntu-Essentials/main/ubuntu-assistant.sh)`</sub>
