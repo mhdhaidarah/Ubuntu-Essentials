@@ -103,6 +103,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mhdhaidarah/Ubuntu-Essential
 | [`disk-extend-100.sh`](disk-extend-100.sh) | Grow the root LVM volume to use 100% of the free space. |
 | [`python-install.sh`](python-install.sh) | Install Python 3 + pip/venv and the common build toolchain. |
 
+## Performance & diagnosis
+
+| Snippet | What it does |
+|---|---|
+| [`perf-report.sh`](perf-report.sh) | **One-page health report** with A/B/C grades: CPU single/all cores, memory bandwidth, disk IOPS and commit speed, load, steal, traffic, failed services, busiest processes. Saved under `/var/log/perf-report/` to compare later. |
+| [`bench-cpu.sh`](bench-cpu.sh) | CPU benchmark (sysbench): single core, all threads, scaling vs cores + hyper-threads, clock under load, steal time, and a class verdict with references. |
+| [`bench-ram.sh`](bench-ram.sh) | Memory now (available, cache, swap, zram, pressure), bandwidth (sequential + random), biggest users, OOM kills. |
+| [`bench-disk.sh`](bench-disk.sh) | Real disk speed with fio and direct I/O: random 4K IOPS, sequential MB/s, fsync commit latency (how a database feels it). 1 GiB scratch file, removed after. |
+| [`bench-net.sh`](bench-net.sh) | Throughput between two of your machines (iperf3): TCP up/down, 4 streams, UDP jitter and loss. `bench-net server` on one side, `bench-net <ip>` on the other. |
+| [`net-top.sh`](net-top.sh) | Live traffic: per interface, per IP (iftop), per process (nethogs), top talkers, connections by state and remote, listening ports. |
+| [`proc-tools.sh`](proc-tools.sh) | Process toolbox: top CPU/memory, tree, find, who owns a port, open files, zombies, usage per service; stop / renice / cap a service's CPU (asks first). |
+| [`stress-check.sh`](stress-check.sh) | Stability burn-in with stress-ng (verify on): CPU + RAM + disk with temperature and clock sampled; "Stable" or the errors found. Not on production in business hours. |
+
 ## Networking
 
 | Snippet | What it does |
